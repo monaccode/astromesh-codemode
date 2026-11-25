@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import re
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ pytest.importorskip("litellm")
 
 import litellm
 
+from astromesh_codemode._synthetic import synthetic_catalog
 from astromesh_codemode.eval import __main__ as cli
 from astromesh_codemode.eval import cost
 from astromesh_codemode.eval.cost import (
@@ -167,6 +169,28 @@ async def test_answer_matches_uses_expected_answer():
     assert not answer_matches("", expected)
 
 
+async def test_answer_with_more_than_the_top_3_is_rejected():
+    for data in ("small", "large"):
+        s = Scenario(8, data)
+        expected = await expected_answer(s)
+        orders = await synthetic_catalog(8)[1].handler(limit=s.rows)
+        top5 = sorted(orders, key=lambda o: o["amount"], reverse=True)[:5]
+        text = "\n".join(
+            f"Order {o['id']}: amount {o['amount']}, customer Customer {o['customer_id']}."
+            for o in top5
+        )
+        assert answer_matches(_final(expected), expected)
+        assert not answer_matches(text, expected), data
+        # An extra customer before or between the expected ones is rejected too.
+        lines = _final(expected).splitlines()
+        assert not answer_matches("\n".join(["Customer 7 first.", *lines]), expected)
+        assert not answer_matches("\n".join([lines[0], "Customer 6 too.", *lines[1:]]), expected)
+    # Word boundaries: "Customer 12" is another customer, "Customer 3." is the same one.
+    fake = [{"order_id": 1, "amount": 11, "customer": "Customer 1"}]
+    assert not answer_matches("Order 1: amount 11, Customer 1 and Customer 12.", fake)
+    assert answer_matches("Order 1: amount 11, Customer 1.", fake)
+
+
 # ---------------------------------------------------------------- the loop
 
 
@@ -290,8 +314,23 @@ async def test_tool_errors_go_back_to_the_model(monkeypatch, no_sleep):
     assert "error" in tool_msgs[1]["content"].lower()
 
 
-class RateLimitError(Exception):
-    pass
+def _rate_limit(msg: str = "slow down") -> Exception:
+    return litellm.RateLimitError(msg, llm_provider="openai", model=MODEL)
+
+
+TRANSIENT = [
+    lambda: litellm.RateLimitError("429", llm_provider="openai", model=MODEL),
+    lambda: litellm.Timeout("timed out", model=MODEL, llm_provider="openai"),
+    lambda: litellm.APIConnectionError("reset", llm_provider="openai", model=MODEL),
+    lambda: litellm.InternalServerError("500", llm_provider="openai", model=MODEL),
+    lambda: litellm.APIError(503, "unavailable", llm_provider="openai", model=MODEL),
+]
+PERMANENT = [
+    lambda: litellm.BadRequestError("too many tools", model=MODEL, llm_provider="openai"),
+    lambda: litellm.AuthenticationError("bad key", llm_provider="openai", model=MODEL),
+    lambda: litellm.ContextWindowExceededError("too long", model=MODEL, llm_provider="openai"),
+    lambda: litellm.NotFoundError("no model", model=MODEL, llm_provider="openai"),
+]
 
 
 async def test_model_error_retries_then_succeeds(monkeypatch, no_sleep):
@@ -300,7 +339,7 @@ async def test_model_error_retries_then_succeeds(monkeypatch, no_sleep):
     def flaky(messages, tools):
         if len(messages) == 2 and failures["left"] > 0:
             failures["left"] -= 1
-            return RateLimitError("slow down")
+            return _rate_limit()
         return scripted_model(messages, tools)
 
     fake = _install(monkeypatch, flaky)
@@ -309,28 +348,107 @@ async def test_model_error_retries_then_succeeds(monkeypatch, no_sleep):
     assert direct.success_rate == 1.0
     assert direct.model_calls == 3.0  # failed requests are not model calls with usage
     assert direct.errors == {}
+    assert direct.status == "ok"
     assert no_sleep == list(cost.RETRY_BACKOFF_S)  # two retries, with backoff
     assert len(fake.requests) == 2 + 3 + 3
 
 
-async def test_model_error_after_retries_fails_the_attempt_not_the_run(monkeypatch, no_sleep):
-    def broken_direct(messages, tools):
-        if "list_orders" in _tool_names(tools) and len(messages) > 2:
-            return RateLimitError("still slow")
+@pytest.mark.parametrize("make", TRANSIENT)
+def test_transient_errors_are_retried(make):
+    assert cost.is_transient(make())
+
+
+@pytest.mark.parametrize("make", PERMANENT)
+async def test_permanent_errors_are_not_retried(monkeypatch, no_sleep, make):
+    exc = make()
+    assert not cost.is_transient(exc)
+
+    def rejects_direct(messages, tools):
+        if "list_orders" in _tool_names(tools):
+            return exc
         return scripted_model(messages, tools)
 
-    fake = _install(monkeypatch, broken_direct)
+    fake = _install(monkeypatch, rejects_direct)
     rows = await run_level2([Scenario(8, "small")], [MODEL], repeats=2)
+    direct = _by_key(rows)[(MODEL, 8, "small", "direct")]
+    assert direct.errors == {type(exc).__name__: 2}
+    assert no_sleep == []  # never retried
+    assert len([r for r in fake.requests if "list_orders" in _tool_names(r["tools"])]) == 2
+
+
+async def test_all_attempts_errored_is_not_runnable_not_free(monkeypatch, no_sleep):
+    # The 512-tool case: providers reject > 128 tools with a 400 on every request.
+    def too_many_tools(messages, tools):
+        if len(tools) > 128:
+            return litellm.BadRequestError(
+                "tools: array too long, maximum 128", model=MODEL, llm_provider="openai"
+            )
+        return scripted_model(messages, tools)
+
+    fake = _install(monkeypatch, too_many_tools)
+    rows = await run_level2([Scenario(512, "small")], [MODEL], repeats=2)
     by = _by_key(rows)
-    direct, cm = by[(MODEL, 8, "small", "direct")], by[(MODEL, 8, "small", "codemode")]
+    direct, cm = by[(MODEL, 512, "small", "direct")], by[(MODEL, 512, "small", "codemode")]
+    assert direct.status == "not_runnable"
     assert direct.success_rate == 0.0
-    assert direct.errors == {"RateLimitError": 2}
-    assert direct.model_calls == 1.0  # the first call answered before the provider broke
-    assert direct.tokens_in == USAGE_IN
-    assert cm.success_rate == 1.0  # the run went on
-    # Each failed turn: 1 try + 2 retries.
-    direct_requests = [r for r in fake.requests if "list_orders" in _tool_names(r["tools"])]
-    assert len(direct_requests) == 2 * (1 + 3)
+    assert direct.errored == 2
+    assert direct.errors == {"BadRequestError": 2}
+    for value in (
+        direct.cost_usd,
+        direct.tokens_in,
+        direct.tokens_out,
+        direct.latency_s,
+        direct.model_calls,
+        direct.cost_per_success,
+    ):
+        assert value is None
+    assert cm.status == "ok"
+    assert cm.success_rate == 1.0
+    # Not retried: one rejected request per attempt.
+    assert len([r for r in fake.requests if len(r["tools"]) > 128]) == 2
+
+    md = cost.format_markdown_l2(rows, "2026-11-25")
+    line = next(x for x in md.splitlines() if "| direct |" in x)
+    assert "not_runnable" in line
+    assert "n/a (BadRequestError)" in line
+    assert "0.000000" not in line
+
+
+async def test_averages_skip_errored_attempts(monkeypatch, no_sleep):
+    # Attempt 1 of direct breaks on its 2nd call (after retries); attempt 2 succeeds.
+    state = {"direct_firsts": 0}
+
+    def second_attempt_ok(messages, tools):
+        if "list_orders" in _tool_names(tools):
+            if len(messages) == 2:
+                state["direct_firsts"] += 1
+            elif state["direct_firsts"] == 1:
+                return _rate_limit("still slow")
+        return scripted_model(messages, tools)
+
+    _install(monkeypatch, second_attempt_ok)
+    rows = await run_level2([Scenario(8, "small")], [MODEL], repeats=2)
+    direct = _by_key(rows)[(MODEL, 8, "small", "direct")]
+    p_in, p_out = _price(MODEL)
+    clean_cost = 3 * (USAGE_IN * p_in + USAGE_OUT * p_out)
+    assert direct.status == "partial"
+    assert direct.errored == 1
+    assert direct.errors == {"RateLimitError": 1}
+    assert direct.success_rate == 0.5  # over every attempt
+    assert direct.model_calls == 3.0  # over the clean attempt only
+    assert direct.tokens_in == 3 * USAGE_IN
+    assert direct.cost_usd == pytest.approx(clean_cost)
+    assert direct.cost_per_success == pytest.approx(clean_cost)
+
+
+async def test_cost_per_success_none_without_success(monkeypatch, no_sleep):
+    _install(monkeypatch, lambda m, t: _response(content="no idea"))
+    rows = await run_level2([Scenario(8, "small")], [MODEL], repeats=2)
+    for r in rows:
+        assert r.status == "ok"
+        assert r.cost_usd is not None
+        assert r.cost_usd > 0
+        assert r.cost_per_success is None
 
 
 async def test_cap_of_twelve_model_calls(monkeypatch, no_sleep):
@@ -359,6 +477,28 @@ async def test_unknown_price_is_refused(monkeypatch, no_sleep):
 # ---------------------------------------------------------------- results and CLI
 
 
+def test_eval_pins_litellm_cost_map_to_the_bundled_copy(monkeypatch):
+    monkeypatch.delenv("LITELLM_LOCAL_MODEL_COST_MAP", raising=False)
+    cost.price_per_token(MODEL)
+    assert cost.os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] == "True"
+
+
+def test_eval_sets_the_local_cost_map_before_litellm_is_imported():
+    import subprocess
+    import sys
+
+    code = (
+        "import os, sys\n"
+        "os.environ.pop('LITELLM_LOCAL_MODEL_COST_MAP', None)\n"
+        "from astromesh_codemode.eval import cost\n"
+        "assert 'litellm' not in sys.modules\n"
+        "cost.price_per_token('gpt-4o-mini')\n"
+        "print(os.environ['LITELLM_LOCAL_MODEL_COST_MAP'])\n"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "True"
+
+
 def test_markdown_and_json(tmp_path):
     s = Scenario(8, "small")
     row = Level2Row(
@@ -372,16 +512,28 @@ def test_markdown_and_json(tmp_path):
         cost_usd=0.000063,
         latency_s=1.25,
         attempts=3,
-        capped=0.0,
+        status="partial",
+        errored=1,
         errors={"RateLimitError": 1},
+        cost_per_success=0.0000945,
+        capped=0.0,
     )
     md = cost.format_markdown_l2([row], "2026-11-25")
     assert "level 2" in md
-    assert "| gpt-4o-mini | 8 | small | direct | 67% |" in md
+    assert "| gpt-4o-mini | 8 | small | direct | partial | 67% |" in md
+    version = importlib.metadata.version("litellm")
+    p_in, p_out = _price(MODEL)
+    assert f"litellm {version}" in md
+    assert f"`{MODEL}` {p_in * 1e6:g} / {p_out * 1e6:g}" in md
+
     payload = cost.to_json_l2([row], "2026-11-25", repeats=3)
     assert payload["level"] == 2
+    assert payload["litellm_version"] == version
+    assert payload["prices_usd"] == {MODEL: {"input_per_token": p_in, "output_per_token": p_out}}
     assert payload["rows"][0]["scenario"] == {"catalog_size": 8, "data": "small", "rows": 5}
     assert payload["rows"][0]["errors"] == {"RateLimitError": 1}
+    assert payload["rows"][0]["status"] == "partial"
+    assert payload["rows"][0]["cost_per_success"] == 0.0000945
     json.dumps(payload)
 
 

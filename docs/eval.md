@@ -296,29 +296,61 @@ A real agent loop, the same for both strategies except for the `tools` array:
   framework would send it.
 - The loop ends when the model answers without tool calls, or after **12 model calls**:
   an attempt still calling tools at the cap fails (`capped`).
-- A model request that fails (rate limit, provider error) is retried twice, after 2 s and
-  8 s. If the third try fails too, the attempt fails and its exception type is recorded
-  in `errors`; the run goes on with the next attempt.
+- A model request that fails with a **transient** error (rate limit, timeout, connection
+  error, 5xx) is retried twice, after 2 s and 8 s. A request the provider **rejects**
+  (bad request, too many tools, context window exceeded, authentication, unknown model)
+  fails the same way every time, so it is not retried. Either way, when the request
+  finally fails the attempt is **errored**: its exception type goes into `errors` and the
+  run goes on with the next attempt.
+
+### Rows a provider cannot run
+
+Providers cap the number of tools per request. OpenAI's API, for one, rejects a request
+with more than 128 tools (a 400 `BadRequestError`), and other providers have caps of
+their own. The 512-tool catalog gives `direct` 256 read-only tools, so with such a
+provider every `direct` attempt there errors before the model sees anything.
+
+Those rows are reported as **`not_runnable`**, not as a cost: `status` is
+`not_runnable`, `success_rate` is 0, and `model_calls`, tokens, cost and latency are
+`null` in the JSON and `n/a (<error type>)` in the table. That is a real result in Code
+Mode's favour (with two tools, it runs where `direct` cannot be sent at all), but it is
+not a token or dollar saving, and it must not be read as one. Splitting the catalog,
+or another way of selecting tools, would be the `direct` alternative to measure there.
 
 ### What it measures
 
-Per (model, scenario, strategy), averaged over the attempts:
+Per (model, scenario, strategy):
 
-- **`success_rate`**: fraction of attempts whose final answer contains the rows of
-  `expected_answer` (the same function as level 1) in order: the three customer names in
-  the expected order, each matched whole, and each row's order id and amount next to its
-  name. The wording is free.
+- **`status`**: `ok` (no attempt errored), `partial` (some did) or `not_runnable` (all did).
+- **`success_rate`**, over **every** attempt (an errored attempt is a failure): fraction
+  of attempts whose final answer gives exactly the rows of `expected_answer` (the same
+  function as level 1), in order. The three customer names must appear in the expected
+  order, each matched whole, and no other customer may be named, so an answer listing the
+  top 5 fails. Each row's order id and amount must sit next to its name. The wording is
+  free.
+
+The following are averages over the attempts that **did not error** (`null` when all did).
+An errored attempt has no comparable cost: a request rejected up front spends nothing,
+and one broken mid-loop stopped at an arbitrary point.
+
 - **`model_calls`**: model requests that returned a response (failed requests do not count).
 - **`tokens_in`, `tokens_out`**: the `usage` the provider reported (`prompt_tokens`,
   `completion_tokens`), summed over the attempt's calls. Not estimated: the provider's
   own tokenizer and tool template.
-- **`cost_usd`**: `tokens_in × input price + tokens_out × output price`, prices per token
-  from `litellm.model_cost` for the installed litellm version. Prompt caching discounts
-  are not applied, so for providers that cache the tools array this overstates `direct`.
+- **`cost_usd`**: `tokens_in × input price + tokens_out × output price`. The prices per
+  token come from the cost map **bundled with the installed litellm**: the eval sets
+  `LITELLM_LOCAL_MODEL_COST_MAP=True` before importing litellm, so litellm does not
+  download the latest map at import. The results record `litellm_version` and each
+  model's `(input, output)` price (`prices_usd` in the JSON, the header of the table), so
+  a rerun with the same litellm uses the same prices. Prompt caching discounts are not
+  applied, so for providers that cache the tools array this overstates `direct`.
+- **`cost_per_success`**: the cost of the non-errored attempts divided by the number of
+  successes (`null` with no success). This is the price of a right answer, failures
+  included.
 - **`latency_s`**: wall clock per attempt, model calls, tool runs and retry waits included.
   The Monty worker pool is started before the timed attempts.
-- **`capped`**, **`errors`**: as above. Failed attempts stay in every average: the tokens
-  they spent were spent.
+- **`capped`**: fraction of the non-errored attempts that hit the 12-call cap.
+- **`errored`**, **`errors`**: how many attempts errored, and by which exception type.
 
 ### Result
 

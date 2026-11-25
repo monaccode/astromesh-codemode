@@ -35,13 +35,17 @@ Level 2 (``run_level2``) runs the same scenarios with real models through
 every tool call the model makes runs against the real handlers or the real ``CodeMode``
 and its result goes back, until the model answers without tool calls or after
 ``MAX_MODEL_CALLS``. Tokens come from each response's ``usage``; cost is ``usage`` x the
-per-token prices in ``litellm.model_cost``. See ``docs/eval.md`` ("Cost — level 2").
+per-token prices of the cost map bundled with the installed litellm. Rows where every
+attempt errored (a provider that rejects 256 tools) are ``not_runnable``, never $0.
+See ``docs/eval.md`` ("Cost — level 2").
 """
 
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import json
+import os
 import re
 import time
 from collections import Counter
@@ -69,6 +73,8 @@ __all__ = [
     "answer_matches",
     "format_markdown",
     "format_markdown_l2",
+    "is_transient",
+    "litellm_version",
     "max_model_requests",
     "missing_api_keys",
     "price_per_token",
@@ -321,33 +327,46 @@ def format_markdown(rows: list[Level1Row], date: str | None = None) -> str:
 MAX_MODEL_CALLS = 12
 """Model calls per attempt; an attempt still calling tools at the cap fails."""
 RETRY_BACKOFF_S = (2.0, 8.0)
-"""Seconds to wait before each retry of a failed model request: 2 retries."""
+"""Seconds to wait before each retry of a transient model error: 2 retries."""
 _sleep = asyncio.sleep  # patched in tests
 
 ToolHandler = Callable[..., Awaitable[Any]]
+RowStatus = Literal["ok", "partial", "not_runnable"]
 
 
 @dataclass(frozen=True)
 class Level2Row:
-    """One (model, scenario, strategy), averaged over ``attempts`` repeats."""
+    """One (model, scenario, strategy) over ``attempts`` repeats.
+
+    ``success_rate`` counts every attempt (an errored one is a failure). The averages
+    (calls, tokens, cost, latency) are over the attempts that did not error, so a provider
+    that rejects the request never shows up as a cheap row: when every attempt errored,
+    ``status`` is ``"not_runnable"`` and the averages are ``None``.
+    """
 
     model: str
     scenario: Scenario
     strategy: Strategy
     success_rate: float
-    """Fraction of attempts whose final answer matched ``expected_answer``."""
-    model_calls: float
-    """Model calls that returned a response (requests that failed are not counted)."""
-    tokens_in: float
-    tokens_out: float
-    cost_usd: float
-    latency_s: float
-    """Wall clock per attempt: model calls, tool runs and retry backoff included."""
+    """Fraction of all attempts whose final answer matched ``expected_answer``."""
+    model_calls: float | None
+    """Model calls that returned a response, per non-errored attempt."""
+    tokens_in: float | None
+    tokens_out: float | None
+    cost_usd: float | None
+    latency_s: float | None
+    """Wall clock per non-errored attempt: model calls, tool runs and retry waits."""
     attempts: int
-    capped: float = 0.0
-    """Fraction of attempts that reached ``MAX_MODEL_CALLS`` still calling tools."""
+    status: RowStatus = "ok"
+    """``ok``: no attempt errored; ``partial``: some did; ``not_runnable``: all did."""
+    errored: int = 0
+    """Attempts lost to a model error (after retries, when it was transient)."""
     errors: dict[str, int] = field(default_factory=dict)
-    """Attempts lost to a model error after the retries, by exception type."""
+    """``errored`` by exception type."""
+    cost_per_success: float | None = None
+    """Cost of the non-errored attempts divided by the successes; ``None`` with none."""
+    capped: float | None = None
+    """Fraction of non-errored attempts that reached ``MAX_MODEL_CALLS`` calling tools."""
 
 
 @dataclass
@@ -362,6 +381,12 @@ class _Attempt:
 
 
 def _litellm() -> Any:
+    """Import litellm with its bundled price map, so prices do not change under a run.
+
+    By default litellm downloads the latest cost map at import time; the eval pins it to
+    the copy shipped with the installed litellm, whose version goes into the results.
+    """
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
     try:
         import litellm
     except ImportError as exc:  # pragma: no cover - depends on the environment
@@ -369,6 +394,11 @@ def _litellm() -> Any:
             "The level-2 cost eval needs litellm: pip install 'astromesh-codemode[eval]'"
         ) from exc
     return litellm
+
+
+def litellm_version() -> str:
+    _litellm()
+    return importlib.metadata.version("litellm")
 
 
 def price_per_token(model: str) -> tuple[float, float] | None:
@@ -387,26 +417,76 @@ def missing_api_keys(model: str) -> list[str]:
     return [] if env.get("keys_in_environment") else list(env.get("missing_keys") or [])
 
 
+_NEVER_RETRY = (
+    "BadRequestError",  # ContextWindowExceededError is a subclass
+    "AuthenticationError",
+    "PermissionDeniedError",
+    "NotFoundError",
+    "ContextWindowExceededError",
+)
+_TRANSIENT = (
+    "RateLimitError",
+    "Timeout",
+    "APIConnectionError",
+    "InternalServerError",
+    "ServiceUnavailableError",
+    "BadGatewayError",
+)
+
+
+def _classes(names: Iterable[str]) -> tuple[type[BaseException], ...]:
+    litellm = _litellm()
+    return tuple(c for n in names if isinstance(c := getattr(litellm, n, None), type))
+
+
+def is_transient(exc: BaseException) -> bool:
+    """Whether a model error is worth retrying: rate limits, timeouts, connection, 5xx.
+
+    A request the provider rejects (bad request, too many tools, context window, auth,
+    unknown model) fails the same way every time, so it is never retried.
+    """
+    if isinstance(exc, _classes(_NEVER_RETRY)):
+        return False
+    if isinstance(exc, _classes(_TRANSIENT)):
+        return True
+    status = getattr(exc, "status_code", None)
+    return isinstance(status, int) and (status == 429 or status >= 500)
+
+
 def _number(n: float) -> re.Pattern[str]:
     return re.compile(rf"(?<![\d.]){re.escape(str(n))}(?:\.0+)?(?!\d)")
 
 
+def _name_family(names: list[str]) -> re.Pattern[str] | None:
+    """For names like ``Customer 3``, a pattern matching any ``Customer <n>``."""
+    prefixes = {m.group(1) for n in names if (m := re.fullmatch(r"(.*\S)\s+\d+", n))}
+    if len(prefixes) != 1:
+        return None
+    return re.compile(rf"(?<!\w){re.escape(prefixes.pop())}\s+\d+(?!\w)")
+
+
 def answer_matches(text: str | None, expected: list[dict]) -> bool:
-    """True when ``text`` gives every row of ``expected_answer``, in order, in any wording.
+    """True when ``text`` gives exactly the rows of ``expected_answer``, in order.
 
     The customer names must appear in the expected order, each matched whole
-    (``Customer 1`` is not found inside ``Customer 12``). Each row's order id and amount
-    must appear between the previous row's name and the next row's name, so they can be
-    written before or after the name ("order 499, 509 USD, Customer 3" or
-    "Customer 3: #499, $509.00").
+    (``Customer 1`` is not found inside ``Customer 12``), and no other customer of the
+    same family may be named (an answer listing the top 5 is wrong). Each row's order id
+    and amount must appear between the previous row's name and the next row's name, so
+    they can be written before or after the name ("order 499, 509 USD, Customer 3" or
+    "Customer 3: #499, $509.00"). The wording is free.
     """
     if not text or not expected:
         return False
+    names = [str(row["customer"]) for row in expected]
+    family = _name_family(names)
+    if family is not None:
+        wanted = {re.sub(r"\s+", " ", n) for n in names}
+        if any(re.sub(r"\s+", " ", m.group(0)) not in wanted for m in family.finditer(text)):
+            return False
     spans: list[tuple[int, int]] = []
     pos = 0
-    for row in expected:
-        name = re.compile(rf"(?<!\w){re.escape(str(row['customer']))}(?!\w)")
-        m = name.search(text, pos)
+    for name in names:
+        m = re.compile(rf"(?<!\w){re.escape(name)}(?!\w)").search(text, pos)
         if m is None:
             return False
         spans.append(m.span())
@@ -429,13 +509,13 @@ def _call_dict(call: Any) -> dict:
 
 
 async def _complete(model: str, messages: list[dict], tools: list[dict]) -> Any:
-    """``litellm.acompletion``, retried ``len(RETRY_BACKOFF_S)`` times; raises the last error."""
+    """``litellm.acompletion``; a transient error is retried ``len(RETRY_BACKOFF_S)`` times."""
     litellm = _litellm()
     for wait in (*RETRY_BACKOFF_S, None):
         try:
             return await litellm.acompletion(model=model, messages=messages, tools=tools)
-        except Exception:
-            if wait is None:
+        except Exception as exc:
+            if wait is None or not is_transient(exc):
                 raise
             await _sleep(wait)
     raise AssertionError("unreachable")  # pragma: no cover
@@ -505,25 +585,32 @@ def _row(
     attempts: list[_Attempt],
     prices: tuple[float, float],
 ) -> Level2Row:
-    n = len(attempts)
     p_in, p_out = prices
+    clean = [a for a in attempts if a.error is None]
+    errored = len(attempts) - len(clean)
+    costs = [a.tokens_in * p_in + a.tokens_out * p_out for a in clean]
+    successes = sum(a.success for a in attempts)
 
-    def mean(xs: Iterable[float]) -> float:
-        return sum(xs) / n
+    def mean(xs: Iterable[float]) -> float | None:
+        return sum(xs) / len(clean) if clean else None
 
+    status: RowStatus = "ok" if not errored else "not_runnable" if not clean else "partial"
     return Level2Row(
         model=model,
         scenario=scenario,
         strategy=strategy,
-        success_rate=mean(a.success for a in attempts),
-        model_calls=mean(a.calls for a in attempts),
-        tokens_in=mean(a.tokens_in for a in attempts),
-        tokens_out=mean(a.tokens_out for a in attempts),
-        cost_usd=mean(a.tokens_in * p_in + a.tokens_out * p_out for a in attempts),
-        latency_s=mean(a.latency_s for a in attempts),
-        attempts=n,
-        capped=mean(a.capped for a in attempts),
+        success_rate=successes / len(attempts),
+        model_calls=mean(a.calls for a in clean),
+        tokens_in=mean(a.tokens_in for a in clean),
+        tokens_out=mean(a.tokens_out for a in clean),
+        cost_usd=mean(costs),
+        latency_s=mean(a.latency_s for a in clean),
+        attempts=len(attempts),
+        status=status,
+        errored=errored,
         errors=dict(Counter(a.error for a in attempts if a.error)),
+        cost_per_success=sum(costs) / successes if successes else None,
+        capped=mean(a.capped for a in clean),
     )
 
 
@@ -574,17 +661,38 @@ def max_model_requests(n_models: int, n_scenarios: int, repeats: int) -> tuple[i
     return calls, calls * (len(RETRY_BACKOFF_S) + 1)
 
 
+def _prices_of(rows: list[Level2Row]) -> dict[str, dict[str, float | None]]:
+    out: dict[str, dict[str, float | None]] = {}
+    for model in dict.fromkeys(r.model for r in rows):
+        p = price_per_token(model)
+        out[model] = {
+            "input_per_token": p[0] if p else None,
+            "output_per_token": p[1] if p else None,
+        }
+    return out
+
+
 def to_json_l2(rows: list[Level2Row], date: str, repeats: int) -> dict:
     return {
         "level": 2,
         "date": date,
         "repeats": repeats,
         "max_model_calls": MAX_MODEL_CALLS,
-        "cost": "response usage x input/output cost per token from litellm.model_cost",
+        "litellm_version": litellm_version(),
+        "cost": "response usage x per-token prices of litellm's bundled model_cost map",
+        "prices_usd": _prices_of(rows),
         "rows": [
             {**asdict(r), "scenario": asdict(r.scenario) | {"rows": r.scenario.rows}} for r in rows
         ],
     }
+
+
+def _fmt(value: float | None, spec: str) -> str:
+    return "n/a" if value is None else format(value, spec)
+
+
+def _per_million(per_token: float | None) -> str:
+    return "n/a" if per_token is None else f"{per_token * 1e6:g}"
 
 
 def format_markdown_l2(rows: list[Level2Row], date: str | None = None) -> str:
@@ -594,21 +702,39 @@ def format_markdown_l2(rows: list[Level2Row], date: str | None = None) -> str:
         repeats = rows[0].attempts if rows else 0
         lines += [
             f"Date: {date}. {repeats} attempts per row, at most {MAX_MODEL_CALLS} model calls "
-            "each; every number but success is an average per attempt. See `docs/eval.md`.",
+            "each. Success counts every attempt; the other numbers are averages over the "
+            "attempts that did not error. See `docs/eval.md`.",
+            "",
+            f"Prices: litellm {litellm_version()} bundled `model_cost`, USD per 1M tokens "
+            "(input / output): "
+            + "; ".join(
+                f"`{m}` {_per_million(p['input_per_token'])} / "
+                f"{_per_million(p['output_per_token'])}"
+                for m, p in _prices_of(rows).items()
+            )
+            + ".",
             "",
         ]
     lines += [
-        "| model | catalog | data | strategy | success | model_calls | tokens_in | tokens_out "
-        "| cost_usd | latency_s | capped | errors |",
-        "|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
+        "| model | catalog | data | strategy | status | success | model_calls | tokens_in "
+        "| tokens_out | cost_usd | cost_per_success | latency_s | capped | errors |",
+        "|---|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for r in rows:
         errors = ", ".join(f"{k} x{v}" for k, v in sorted(r.errors.items()))
-        lines.append(
+        head = (
             f"| {r.model} | {r.scenario.catalog_size} | {r.scenario.data} | {r.strategy} "
-            f"| {r.success_rate:.0%} | {r.model_calls:.1f} | {r.tokens_in:.0f} "
-            f"| {r.tokens_out:.0f} | {r.cost_usd:.6f} | {r.latency_s:.2f} "
-            f"| {r.capped:.0%} | {errors} |"
+            f"| {r.status} | {r.success_rate:.0%} "
+        )
+        if r.status == "not_runnable":
+            na = f"n/a ({', '.join(sorted(r.errors))})"
+            lines.append(head + f"| {na} " * 7 + f"| {errors} |")
+            continue
+        lines.append(
+            head + f"| {_fmt(r.model_calls, '.1f')} | {_fmt(r.tokens_in, '.0f')} "
+            f"| {_fmt(r.tokens_out, '.0f')} | {_fmt(r.cost_usd, '.6f')} "
+            f"| {_fmt(r.cost_per_success, '.6f')} | {_fmt(r.latency_s, '.2f')} "
+            f"| {_fmt(r.capped, '.0%')} | {errors} |"
         )
     lines.append("")
     return "\n".join(lines)
