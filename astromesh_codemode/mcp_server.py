@@ -100,6 +100,23 @@ async def _connect(stack: AsyncExitStack, up: UpstreamConfig) -> ClientSession:
     return session
 
 
+def _set_tool_schema(server: FastMCP, name: str, schema: dict) -> None:
+    """Publish ``schema`` verbatim as the tool's inputSchema (FastMCP has no public hook)."""
+    try:
+        server._tool_manager.get_tool(name).parameters = schema
+    except Exception as e:
+        try:
+            from importlib.metadata import PackageNotFoundError, version
+
+            ver = version("mcp")
+        except PackageNotFoundError:
+            ver = "unknown"
+        raise RuntimeError(
+            f"astromesh-codemode: could not set the tool schema on FastMCP {ver}; "
+            "this mcp version is not supported (tested with mcp>=1.28,<2)"
+        ) from e
+
+
 async def build_server(
     config: ProxyConfig, *, sessions: dict[str, ClientSession] | None = None
 ) -> FastMCP:
@@ -129,8 +146,7 @@ async def build_server(
 
     for fn, tool in ((search, search_def), (run, run_def)):
         server.add_tool(fn, name=tool.name, description=tool.description)
-        # Publish the NeutralTool's JSON Schema unchanged.
-        server._tool_manager.get_tool(tool.name).parameters = tool.parameters
+        _set_tool_schema(server, tool.name, tool.parameters)
 
     async def aclose_codemode() -> None:
         await cm.aclose()

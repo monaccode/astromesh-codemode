@@ -6,6 +6,7 @@ from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import ToolAnnotations
 
 from astromesh_codemode.cli import main
+from astromesh_codemode.codemode import CodeMode
 from astromesh_codemode.mcp_server import ProxyConfig, build_server
 
 
@@ -129,3 +130,22 @@ def test_cli_help(capsys):
         main(["--help"])
     assert e.value.code == 0
     assert "mcp" in capsys.readouterr().out
+
+
+async def test_published_schema_is_the_neutral_schema():
+    neutral = {t.name: t for t in CodeMode([], name="codemode").tool_definitions()}
+    async with create_connected_server_and_client_session(_upstream()._mcp_server) as up:
+        server = await build_server(_config(), sessions={"crm": up})
+        async with create_connected_server_and_client_session(server._mcp_server) as client:
+            tools = (await client.list_tools()).tools
+            assert len(tools) == 2
+            for t in tools:
+                assert t.inputSchema == neutral[t.name].parameters
+                assert t.description == neutral[t.name].description
+            only_query = await client.call_tool("codemode_search", {"query": "user"})
+            assert not only_query.isError
+            assert "crm_get_user" in only_query.content[0].text
+            with_limit = await client.call_tool("codemode_search", {"query": "", "limit": 1})
+            assert not with_limit.isError
+            assert with_limit.content[0].text.count("async def") == 1
+        await server.aclose_codemode()

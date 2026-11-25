@@ -18,6 +18,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         import anyio
+        import yaml  # noqa: F401  (checked here so a missing extra gives the hint)
 
         from astromesh_codemode.mcp_server import ProxyConfig, serve_stdio
     except ImportError:
