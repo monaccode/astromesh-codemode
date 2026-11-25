@@ -1,0 +1,376 @@
+{
+  "level": 1,
+  "date": "2026-11-25",
+  "tokenizer": "o200k_base",
+  "model": "scripted",
+  "rows": [
+    {
+      "scenario": {
+        "catalog_size": 8,
+        "data": "small",
+        "rows": 5
+      },
+      "strategy": "direct",
+      "context_tokens": 1989,
+      "output_tokens": 74,
+      "model_calls": 3,
+      "answer": [
+        {
+          "order_id": 4,
+          "amount": 14,
+          "customer": "Customer 5"
+        },
+        {
+          "order_id": 3,
+          "amount": 13,
+          "customer": "Customer 4"
+        },
+        {
+          "order_id": 2,
+          "amount": 12,
+          "customer": "Customer 3"
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "catalog_size": 8,
+        "data": "small",
+        "rows": 5
+      },
+      "strategy": "codemode",
+      "context_tokens": 1897,
+      "output_tokens": 164,
+      "model_calls": 3,
+      "answer": [
+        {
+          "order_id": 4,
+          "amount": 14,
+          "customer": "Customer 5"
+        },
+        {
+          "order_id": 3,
+          "amount": 13,
+          "customer": "Customer 4"
+        },
+        {
+          "order_id": 2,
+          "amount": 12,
+          "customer": "Customer 3"
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "catalog_size": 8,
+        "data": "large",
+        "rows": 500
+      },
+      "strategy": "direct",
+      "context_tokens": 20799,
+      "output_tokens": 74,
+      "model_calls": 3,
+      "answer": [
+        {
+          "order_id": 499,
+          "amount": 509,
+          "customer": "Customer 3"
+        },
+        {
+          "order_id": 498,
+          "amount": 508,
+          "customer": "Customer 2"
+        },
+        {
+          "order_id": 497,
+          "amount": 507,
+          "customer": "Customer 1"
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "catalog_size": 8,
+        "data": "large",
+        "rows": 500
+      },
+      "strategy": "codemode",
+      "context_tokens": 1897,
+      "output_tokens": 164,
+      "model_calls": 3,
+      "answer": [
+        {
+          "order_id": 499,
+          "amount": 509,
+          "customer": "Customer 3"
+        },
+        {
+          "order_id": 498,
+          "amount": 508,
+          "customer": "Customer 2"
+        },
+        {
+          "order_id": 497,
+          "amount": 507,
+          "customer": "Customer 1"
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "catalog_size": 64,
+        "data": "small",
+        "rows": 5
+      },
+      "strategy": "direct",
+      "context_tokens": 13758,
+      "output_tokens": 74,
+      "model_calls": 3,
+      "answer": [
+        {
+          "order_id": 4,
+          "amount": 14,
+          "customer": "Customer 5"
+        },
+        {
+          "order_id": 3,
+          "amount": 13,
+          "customer": "Customer 4"
+        },
+        {
+          "order_id": 2,
+          "amount": 12,
+          "customer": "Customer 3"
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "catalog_size": 64,
+        "data": "small",
+        "rows": 5
+      },
+      "strategy": "codemode",
+      "context_tokens": 2073,
+      "output_tokens": 164,
+      "model_calls": 3,
+      "answer": [
+        {
+          "order_id": 4,
+          "amount": 14,
+          "customer": "Customer 5"
+        },
+        {
+          "order_id": 3,
+          "amount": 13,
+          "customer": "Customer 4"
+        },
+        {
+          "order_id": 2,
+          "amount": 12,
+          "customer": "Customer 3"
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "catalog_size": 64,
+        "data": "large",
+        "rows": 500
+      },
+      "strategy": "direct",
+      "context_tokens": 32568,
+      "output_tokens": 74,
+      "model_calls": 3,
+      "answer": [
+        {
+          "order_id": 499,
+          "amount": 509,
+          "customer": "Customer 3"
+        },
+        {
+          "order_id": 498,
+          "amount": 508,
+          "customer": "Customer 2"
+        },
+        {
+          "order_id": 497,
+          "amount": 507,
+          "customer": "Customer 1"
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "catalog_size": 64,
+        "data": "large",
+        "rows": 500
+      },
+      "strategy": "codemode",
+      "context_tokens": 2073,
+      "output_tokens": 164,
+      "model_calls": 3,
+      "answer": [
+        {
+          "order_id": 499,
+          "amount": 509,
+          "customer": "Customer 3"
+        },
+        {
+          "order_id": 498,
+          "amount": 508,
+          "customer": "Customer 2"
+        },
+        {
+          "order_id": 497,
+          "amount": 507,
+          "customer": "Customer 1"
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "catalog_size": 512,
+        "data": "small",
+        "rows": 5
+      },
+      "strategy": "direct",
+      "context_tokens": 107643,
+      "output_tokens": 74,
+      "model_calls": 3,
+      "answer": [
+        {
+          "order_id": 4,
+          "amount": 14,
+          "customer": "Customer 5"
+        },
+        {
+          "order_id": 3,
+          "amount": 13,
+          "customer": "Customer 4"
+        },
+        {
+          "order_id": 2,
+          "amount": 12,
+          "customer": "Customer 3"
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "catalog_size": 512,
+        "data": "small",
+        "rows": 5
+      },
+      "strategy": "codemode",
+      "context_tokens": 1897,
+      "output_tokens": 164,
+      "model_calls": 3,
+      "answer": [
+        {
+          "order_id": 4,
+          "amount": 14,
+          "customer": "Customer 5"
+        },
+        {
+          "order_id": 3,
+          "amount": 13,
+          "customer": "Customer 4"
+        },
+        {
+          "order_id": 2,
+          "amount": 12,
+          "customer": "Customer 3"
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "catalog_size": 512,
+        "data": "large",
+        "rows": 500
+      },
+      "strategy": "direct",
+      "context_tokens": 126453,
+      "output_tokens": 74,
+      "model_calls": 3,
+      "answer": [
+        {
+          "order_id": 499,
+          "amount": 509,
+          "customer": "Customer 3"
+        },
+        {
+          "order_id": 498,
+          "amount": 508,
+          "customer": "Customer 2"
+        },
+        {
+          "order_id": 497,
+          "amount": 507,
+          "customer": "Customer 1"
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "catalog_size": 512,
+        "data": "large",
+        "rows": 500
+      },
+      "strategy": "codemode",
+      "context_tokens": 1897,
+      "output_tokens": 164,
+      "model_calls": 3,
+      "answer": [
+        {
+          "order_id": 499,
+          "amount": 509,
+          "customer": "Customer 3"
+        },
+        {
+          "order_id": 498,
+          "amount": 508,
+          "customer": "Customer 2"
+        },
+        {
+          "order_id": 497,
+          "amount": 507,
+          "customer": "Customer 1"
+        }
+      ]
+    }
+  ],
+  "ratios": [
+    {
+      "catalog_size": 8,
+      "data": "small",
+      "codemode/direct": 0.9537
+    },
+    {
+      "catalog_size": 8,
+      "data": "large",
+      "codemode/direct": 0.0912
+    },
+    {
+      "catalog_size": 64,
+      "data": "small",
+      "codemode/direct": 0.1507
+    },
+    {
+      "catalog_size": 64,
+      "data": "large",
+      "codemode/direct": 0.0637
+    },
+    {
+      "catalog_size": 512,
+      "data": "small",
+      "codemode/direct": 0.0176
+    },
+    {
+      "catalog_size": 512,
+      "data": "large",
+      "codemode/direct": 0.015
+    }
+  ]
+}

@@ -39,3 +39,12 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --locked --python 3.12
       - run: uv run --python 3.12 python -m astromesh_codemode.eval traps
+  cost-l1:
+    # Cost eval, level 1: scripted model, real tools, tiktoken o200k_base. Deterministic;
+    # fails if it errors or if its directional/answer checks break. See docs/eval.md.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked --python 3.12
+      - run: uv run --python 3.12 python -m astromesh_codemode.eval cost --level 1 --out ${{ runner.temp }}/results

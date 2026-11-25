@@ -101,3 +101,121 @@ With the default limits, the three 100 MiB attempts on `output_flood` end in
 `max_memory`. Printed output is collected up to max(1 MiB, 4 × `max_output_bytes`), and
 past that the run fails with a `MemoryError` that the trace records as `max_memory`. The
 two attempts under that limit are what exercise truncation itself (`max_output_bytes hit: 2`).
+
+## Cost — level 1: context carried, with a scripted model
+
+Code Mode's claim is that it saves context: the model sees two tool schemas instead of
+the whole catalog, and tool results stay in the sandbox instead of flowing back into
+the conversation. The price is that the model has to *write a program*, which is more
+output, and which Astromesh's earlier language (Glyph) measured as *more* expensive than
+plain tool calling. Level 1 measures both sides without calling any model, so it is
+deterministic and runs in CI.
+
+```bash
+uv sync --extra eval      # or the dev group: tiktoken is all level 1 needs
+uv run python -m astromesh_codemode.eval cost --level 1   # writes results/<date>-L1.{json,md}
+```
+
+```python
+from astromesh_codemode.eval.cost import run_level1
+from astromesh_codemode.eval.scenarios import SCENARIOS, Scenario
+
+rows = await run_level1(SCENARIOS)  # or [Scenario(4, "small")], any size >= 3
+```
+
+### The task and the scenarios
+
+One fixed task: "look at the last N orders (`list_orders(limit=N)`), take the 3 with the
+highest amount, fetch each one's customer with `get_customer`, answer with order id,
+amount and customer name". The tools are `synthetic_catalog(n)`: the four core tools
+first, then generated ones (about half of them `writes=True` from 64 tools on).
+Order `i` has amount `10 + i`, so the top 3 never tie.
+
+Six scenarios: catalog size `{8, 64, 512}` × data `{small: 5 rows, large: 500 rows}`.
+The system prompt and the user message are the same text for both strategies.
+
+### The two strategies, three model calls each
+
+| Call | `direct` (classic tool calling) | `codemode` |
+|---|---|---|
+| tools array | every tool of the catalog, on every call | `codemode_search` and `codemode_run` only |
+| 1 | calls `list_orders(limit=N)` | calls `codemode_search("list orders and get customer")` |
+| 2 | sees the real rows (JSON), calls `get_customer` three times in one turn (parallel tool calls) | sees the real `search` output, sends one fixed program to `codemode_run` (fetch, sort, top 3, `asyncio.gather` the customers, return a compact list) |
+| 3 | sees the three customers, answers | sees the real `run` output, answers |
+
+The tool results are real: `direct` runs the catalog's handlers, `codemode` runs a real
+`CodeMode` (real `search`, real Monty sandbox). The scripted model takes its decisions
+by parsing what it was sent (the rows, the customers, the `result:` line of `run`), and
+the test checks that both strategies reach the answer computed straight from the
+handlers.
+
+### How it counts
+
+Tokens are counted with `tiktoken` `o200k_base`.
+
+- **Input tokens of a call** = the JSON of the OpenAI-style `tools` array
+  (`{"type": "function", "function": {name, description, parameters}}`, `json.dumps`
+  defaults) + every message sent so far + 3 tokens of reply priming. Each message
+  counts 3 tokens of overhead + its role + its content + the name and arguments of each
+  tool call it carries (OpenAI's published estimate for chat templates).
+- **`context_tokens`** = input tokens summed over every model call. Each call re-sends
+  the whole conversation and the tools array, so a big result or a big catalog is paid
+  once per later call.
+- **`output_tokens`** = what the model emits: tool-call names and argument JSON (for
+  `codemode_run`, that is the program), or the final answer.
+- **`ratio`** = `codemode.context_tokens / direct.context_tokens`. Below 1 Code Mode
+  carries less context; above 1 it carries more.
+
+### Result
+
+Date: 2026-11-25. Tokenizer: `o200k_base`.
+
+| catalog | data | strategy | model_calls | context_tokens | output_tokens | ratio codemode/direct |
+|---:|---|---|---:|---:|---:|---:|
+| 8 | small | direct | 3 | 1989 | 74 |  |
+| 8 | small | codemode | 3 | 1897 | 164 | 0.95 |
+| 8 | large | direct | 3 | 20799 | 74 |  |
+| 8 | large | codemode | 3 | 1897 | 164 | 0.09 |
+| 64 | small | direct | 3 | 13758 | 74 |  |
+| 64 | small | codemode | 3 | 2073 | 164 | 0.15 |
+| 64 | large | direct | 3 | 32568 | 74 |  |
+| 64 | large | codemode | 3 | 2073 | 164 | 0.06 |
+| 512 | small | direct | 3 | 107643 | 74 |  |
+| 512 | small | codemode | 3 | 1897 | 164 | 0.02 |
+| 512 | large | direct | 3 | 126453 | 74 |  |
+| 512 | large | codemode | 3 | 1897 | 164 | 0.02 |
+
+ratio < 1: Code Mode carries less context; > 1: it carries more.
+Read it with its losses:
+
+- **Output: Code Mode loses in every scenario** (164 vs 74 tokens). Writing a program
+  costs more than emitting three tool calls, and output tokens are usually the expensive
+  ones. `tests/test_cost_l1.py` asserts this, so it stays visible.
+- **Small catalog, small data: about even.** At 8 tools and 5 rows Code Mode's context is
+  0.95 of direct's, and adding output tokens the totals are within a couple of tokens.
+  With only the 4 core tools (`Scenario(4, "small")`) Code Mode carries **more** context
+  (about 1.3×: its two long tool descriptions and the `search` output outweigh four
+  small schemas); the test asserts that too.
+- **Large data or a large catalog: Code Mode carries far less.** 500 rows go back into
+  `direct`'s context and are re-sent on the next calls; in Code Mode they stay in the
+  sandbox. A 512-tool catalog costs `direct` its schemas on every call.
+- The `direct` tools array holds the whole catalog, `writes=True` tools included, while
+  Code Mode v0.1 exposes only read tools. A read-only classic agent that dropped the
+  write tools would carry less: for 64 and 512 tools the ratio would be about 0.27 and
+  0.03 with small data, instead of 0.15 and 0.02.
+
+### Limits of level 1
+
+- **The model is scripted.** It never errs, never repairs a program, never re-searches,
+  never calls a tool it did not need. Real models do: a wrong argument in `direct`, or a
+  program that fails in `run`, adds calls, and each extra call re-sends the whole
+  context. Level 1 is the floor for both strategies, not what an agent will spend.
+- **One task shape.** Fetch, filter, fan out. Tasks where the model must read every
+  result anyway (summarise these 500 rows in prose) favour Code Mode less.
+- **One tokenizer, one template.** `o200k_base` and OpenAI's per-message estimate.
+  Other providers tokenise and template tools differently, and some cache the tools
+  array between calls, which shrinks `direct`'s schema cost.
+- **No prices.** Tokens only; input and output are reported separately, not weighted.
+
+Level 2 runs the same task with real models and counts what they actually spend,
+repair loops and extra calls included.
