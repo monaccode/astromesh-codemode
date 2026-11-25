@@ -10,6 +10,7 @@ async def test_langchain_async():
     cm = make_cm()
     tools = as_tools(cm)
     assert [t.name for t in tools] == NAMES
+    assert tools[1].description == cm.tool_definitions()[1].description
     assert set(tools[1].args) == {"code"}
     assert "3" in await tools[1].ainvoke({"code": CODE})
     assert "get_rows" in await tools[0].ainvoke({"query": "rows"})

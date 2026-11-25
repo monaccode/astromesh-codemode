@@ -4,6 +4,6 @@ Import the module of the framework you use (``astromesh_codemode.adapters.langch
 each one needs its extra (``pip install 'astromesh-codemode[langchain]'``).
 """
 
-from astromesh_codemode.adapters._common import MissingExtraError, run_sync
+from astromesh_codemode.adapters._common import MissingExtraError, close_sync, run_sync
 
-__all__ = ["MissingExtraError", "run_sync"]
+__all__ = ["MissingExtraError", "close_sync", "run_sync"]

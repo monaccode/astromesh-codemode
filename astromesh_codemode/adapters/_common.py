@@ -9,6 +9,9 @@ every sync call. Pick one style per ``CodeMode``: a pool started by sync calls i
 the background loop, so awaiting ``run`` from your own loop afterwards fails; build one
 ``CodeMode`` per style.
 
+Closing: sync users call ``close_sync(cm)`` (closes the pool and the loop thread); async
+users call ``await cm.aclose()``.
+
 A sync call made from a thread whose own event loop is running is refused (it would block
 that loop): use the framework's async API there, or ``asyncio.to_thread``.
 """
@@ -27,6 +30,7 @@ from astromesh_codemode.codemode import CodeMode, NeutralTool
 __all__ = [
     "MissingExtraError",
     "async_handler",
+    "close_sync",
     "model_from_schema",
     "require",
     "run_sync",
@@ -48,28 +52,57 @@ def require(module: str, extra: str) -> ModuleType:
         ) from exc
 
 
-_bridges: weakref.WeakKeyDictionary[CodeMode, asyncio.AbstractEventLoop] = (
-    weakref.WeakKeyDictionary()
-)
+_bridges: weakref.WeakKeyDictionary[CodeMode, _Bridge] = weakref.WeakKeyDictionary()
 _bridges_lock = threading.Lock()
 
 
-def _stop(loop: asyncio.AbstractEventLoop) -> None:
-    if not loop.is_closed():
-        loop.call_soon_threadsafe(loop.stop)
+class _Bridge:
+    """The background loop thread of one ``CodeMode``."""
+
+    def __init__(self, cm: CodeMode):
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(
+            target=self.loop.run_forever, name=f"astromesh-codemode-{cm.name}", daemon=True
+        )
+        self.thread.start()
+        # Runs once: at close_sync(), or when the CodeMode is garbage-collected.
+        self.shutdown = weakref.finalize(cm, _shutdown, self.loop, self.thread)
+
+
+def _shutdown(loop: asyncio.AbstractEventLoop, thread: threading.Thread) -> None:
+    """Stop the loop, wait for its thread and close the loop."""
+    if loop.is_closed():
+        return
+    loop.call_soon_threadsafe(loop.stop)
+    if thread is not threading.current_thread():
+        thread.join(timeout=5)
+    if not thread.is_alive():
+        loop.close()
 
 
 def _bridge_loop(cm: CodeMode) -> asyncio.AbstractEventLoop:
     with _bridges_lock:
-        loop = _bridges.get(cm)
-        if loop is None or loop.is_closed():
-            loop = asyncio.new_event_loop()
-            threading.Thread(
-                target=loop.run_forever, name=f"astromesh-codemode-{cm.name}", daemon=True
-            ).start()
-            _bridges[cm] = loop
-            weakref.finalize(cm, _stop, loop)
-        return loop
+        bridge = _bridges.get(cm)
+        if bridge is None or bridge.loop.is_closed():
+            bridge = _bridges[cm] = _Bridge(cm)
+        return bridge.loop
+
+
+def close_sync(cm: CodeMode) -> None:
+    """Close ``cm``'s Monty pool and its background loop, from sync code.
+
+    The sync counterpart of ``await cm.aclose()``. A no-op when ``cm`` never ran a sync
+    call; safe to call twice. A later sync call starts a fresh loop and pool.
+    """
+    with _bridges_lock:
+        bridge = _bridges.pop(cm, None)
+    if bridge is None:
+        return
+    try:
+        if not bridge.loop.is_closed():
+            asyncio.run_coroutine_threadsafe(cm.aclose(), bridge.loop).result()
+    finally:
+        bridge.shutdown()
 
 
 def run_sync(cm: CodeMode, coro: Any) -> Any:
