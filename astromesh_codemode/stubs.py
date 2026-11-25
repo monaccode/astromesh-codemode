@@ -72,6 +72,10 @@ def index_by_py_name(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
     index: dict[str, ToolSpec] = {}
     for spec in specs:
         key = py_name(spec.name)
+        if not key.isidentifier() or keyword.iskeyword(key):
+            raise ValueError(
+                f"tool name {spec.name!r} maps to {key!r}, which is not a valid Python function name"
+            )
         if key in index:
             raise ValueError(
                 f"tool names {index[key].name!r} and {spec.name!r} both map to "

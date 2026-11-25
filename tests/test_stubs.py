@@ -100,3 +100,10 @@ def test_render_stub_invalid_param_names():
     assert '- "from": str, required' in out
     assert '- "a-b": int' in out
     ast.parse(out)
+
+
+@pytest.mark.parametrize("name", ["import", "class", "", "None", "x²"])
+def test_index_rejects_invalid_python_names(name):
+    with pytest.raises(ValueError, match="not a valid Python function name") as exc:
+        index_by_py_name([_spec(name)])
+    assert repr(name) in str(exc.value)
