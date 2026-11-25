@@ -199,3 +199,89 @@ async def test_no_state_between_runs(setup):
     assert await cm.run("x = 1\nx") == "result: 1"
     out = await cm.run("x")
     assert out.startswith("NameError")
+
+
+def _slow_spec(state: dict):
+    from astromesh_codemode import ToolSpec
+
+    async def slow() -> int:
+        state["started"] += 1
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            state["cancelled"] += 1
+            raise
+        state["finished"] += 1
+        return 1
+
+    return ToolSpec("slow", "Sleeps.", {"type": "object", "properties": {}}, slow)
+
+
+def _slow_tasks_pending() -> list[asyncio.Task]:
+    return [
+        t
+        for t in asyncio.all_tasks()
+        if not t.done() and "slow" in getattr(t.get_coro(), "__qualname__", "")
+    ]
+
+
+async def test_timeout_cancels_pending_handlers():
+    state = {"started": 0, "cancelled": 0, "finished": 0}
+    async with CodeMode([_slow_spec(state)], limits=Limits(timeout_s=0.5)) as cm:
+        out, trace = await cm.run_traced(
+            "import asyncio\nawait asyncio.gather(slow(), slow(), slow())"
+        )
+        assert "TimeoutError" in out
+        assert trace.limit_hit == "timeout"
+        assert state["started"] == 3
+        assert state["cancelled"] == 3
+        assert state["finished"] == 0
+        assert _slow_tasks_pending() == []
+        assert [c.error for c in trace.calls] == ["cancelled"] * 3
+
+
+async def test_max_calls_cancels_sibling_handlers():
+    state = {"started": 0, "cancelled": 0, "finished": 0}
+    async with CodeMode([_slow_spec(state)], limits=Limits(max_calls=2, timeout_s=10)) as cm:
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        out, trace = await cm.run_traced(
+            "import asyncio\nawait asyncio.gather(slow(), slow(), slow())"
+        )
+        assert loop.time() - t0 < 5
+        assert "max_calls" in out
+        assert trace.limit_hit == "max_calls"
+        assert state["finished"] == 0
+        assert state["cancelled"] == state["started"]
+        assert _slow_tasks_pending() == []
+        assert len(trace.calls) == 3
+        assert sorted(c.error_type or "" for c in trace.calls) == [
+            "CancelledError",
+            "CancelledError",
+            "RuntimeError",
+        ]
+
+
+async def test_huge_int_result_returns_text(setup):
+    cm, _ = setup
+    out = await cm.run("return 10 ** 5000")
+    assert isinstance(out, str)
+    assert out.startswith("result: ")
+    assert "unrenderable" in out
+
+
+async def test_huge_int_argument_returns_text(setup):
+    cm, _ = setup
+    out = await cm.run("await stamp(x=10 ** 5000)")
+    assert isinstance(out, str)
+    assert cm.last_trace.calls[0].tool == "stamp"
+
+
+async def test_handler_value_with_broken_repr(setup):
+    cm, calls = setup
+    out = await cm.run("await broken()")
+    assert calls["broken"] == 1
+    assert isinstance(out, str)
+    assert "BrokenRepr" in out
+    assert len(cm.last_trace.calls) == 1
+    assert cm.last_trace.calls[0].tool == "broken"

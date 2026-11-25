@@ -7,9 +7,16 @@ from typing import Any
 from astromesh_codemode._synthetic import synthetic_catalog
 from astromesh_codemode.spec import ToolError, ToolSpec
 
-__all__ = ["STAMP", "Opaque", "make_tools", "synthetic_catalog"]
+__all__ = ["STAMP", "BrokenRepr", "Opaque", "make_tools", "synthetic_catalog"]
 
 STAMP = datetime(2026, 11, 25, 10, 30, tzinfo=UTC)
+
+
+class BrokenRepr:
+    """An object whose repr fails, like a half-initialised ORM row."""
+
+    def __repr__(self) -> str:
+        raise RuntimeError("repr exploded")
 
 
 class Opaque:
@@ -47,6 +54,10 @@ def make_tools() -> tuple[list[ToolSpec], Counter[str]]:
         calls["crash"] += 1
         raise KeyError("postgres://admin:secret@db/prod")
 
+    async def broken() -> Any:
+        calls["broken"] += 1
+        return {"row": BrokenRepr()}
+
     def schema(props: dict, required: list[str] | None = None) -> dict:
         return {"type": "object", "properties": props, "required": required or []}
 
@@ -69,5 +80,6 @@ def make_tools() -> tuple[list[ToolSpec], Counter[str]]:
         ),
         ToolSpec("opaque", "Return a host object.", schema({}), opaque),
         ToolSpec("crash", "Fail with an unexpected host error.", schema({}), crash),
+        ToolSpec("broken", "Return an object that cannot be printed.", schema({}), broken),
     ]
     return specs, calls

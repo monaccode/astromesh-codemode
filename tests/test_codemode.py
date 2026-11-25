@@ -139,3 +139,60 @@ async def test_emit_otel():
 def test_emit_otel_without_sdk_is_noop():
     t = Trace("1", [], "result: 1", None, None, 1.0)
     emit_otel(t)  # global no-op provider: must not raise
+
+
+def _otel_provider():
+    pytest.importorskip("opentelemetry")
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return provider, exporter
+
+
+SENSITIVE_CODE = (
+    "try:\n    await boom()\nexcept Exception:\n    pass\nawait get_rows(n=31337)\nawait crash()"
+)
+
+
+def _span_text(span) -> str:
+    parts = [str(v) for v in span.attributes.values()]
+    parts.append(str(span.status.description))
+    return " ".join(parts)
+
+
+async def test_emit_otel_hides_sensitive_data_by_default():
+    provider, exporter = _otel_provider()
+    specs, _ = make_tools()
+    async with CodeMode(specs) as cm:
+        await cm.run(SENSITIVE_CODE)
+        emit_otel(cm.last_trace, tracer_provider=provider)
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 4
+    for span in spans:
+        assert "codemode.args" not in span.attributes
+        text = _span_text(span)
+        for secret in ("31337", "crm caído", "secret", "postgres", "failed with"):
+            assert secret not in text, (span.name, secret)
+    by_name = {s.name: s for s in spans}
+    assert by_name["boom"].attributes["codemode.error_type"] == "ToolError"
+    assert by_name["boom"].status.description == "ToolError"
+    assert by_name["crash"].attributes["codemode.error_type"] == "KeyError"
+    assert by_name["codemode.run"].attributes["codemode.error_type"] == "RuntimeError"
+    assert by_name["codemode.run"].status.description == "RuntimeError"
+    assert by_name["get_rows"].attributes["codemode.bytes"] > 0
+
+
+async def test_emit_otel_include_args():
+    provider, exporter = _otel_provider()
+    specs, _ = make_tools()
+    async with CodeMode(specs) as cm:
+        await cm.run(SENSITIVE_CODE)
+        emit_otel(cm.last_trace, tracer_provider=provider, include_args=True)
+    by_name = {s.name: s for s in exporter.get_finished_spans()}
+    assert "31337" in by_name["get_rows"].attributes["codemode.args"]
+    assert "crm caído" in by_name["boom"].attributes["codemode.error"]
+    assert "crash() failed" in by_name["codemode.run"].attributes["codemode.error"]
