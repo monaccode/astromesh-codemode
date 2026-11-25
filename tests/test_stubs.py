@@ -1,3 +1,5 @@
+import ast
+
 import pytest
 
 from astromesh_codemode.spec import ToolSpec
@@ -52,6 +54,7 @@ def test_render_stub():
     assert "async def crm_get_contact(id: int, fields: list[str] | None = None) -> Any:" in out
     assert '    """Fetch a contact."""' in out
     compile(out, "<stub>", "exec")
+    ast.parse(out)
 
 
 def test_render_stub_output_schema_and_multiline_description():
@@ -75,3 +78,25 @@ def test_collision():
 def test_index_ok():
     a, b = _spec("a-b"), _spec("c")
     assert index_by_py_name([a, b]) == {"a_b": a, "c": b}
+
+
+def test_render_stub_invalid_param_names():
+    spec = _spec(
+        "t",
+        description="Does things.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "from": {"type": "string"},
+                "a-b": {"type": "integer"},
+                "ok": {"type": "boolean"},
+            },
+            "required": ["from"],
+        },
+    )
+    out = render_stub(spec)
+    assert "ok: bool | None = None" in out
+    assert "**kwargs: Any" in out
+    assert '- "from": str, required' in out
+    assert '- "a-b": int' in out
+    ast.parse(out)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import keyword
 import re
 
 from astromesh_codemode.spec import ToolSpec
@@ -37,19 +38,34 @@ def annotation(schema: dict) -> str:
     return _SIMPLE.get(t, "Any")
 
 
-def _docstring(text: str) -> str:
-    one_line = " ".join(text.split()).replace("\\", "\\\\").replace('"', "'")
-    return f'"""{one_line}"""'
+def _escape(text: str) -> str:
+    return " ".join(text.split()).replace("\\", "\\\\").replace('"', "'")
+
+
+def _is_valid_param(name: str) -> bool:
+    return name.isidentifier() and not keyword.iskeyword(name)
 
 
 def render_stub(spec: ToolSpec) -> str:
     props = spec.input_schema.get("properties", {}) or {}
     required = set(spec.input_schema.get("required", []) or [])
-    params = [f"{n}: {annotation(s)}" for n, s in props.items() if n in required]
-    params += [f"{n}: {annotation(s)} | None = None" for n, s in props.items() if n not in required]
+    valid = {n: s for n, s in props.items() if _is_valid_param(n)}
+    invalid = {n: s for n, s in props.items() if not _is_valid_param(n)}
+    params = [f"{n}: {annotation(s)}" for n, s in valid.items() if n in required]
+    params += [f"{n}: {annotation(s)} | None = None" for n, s in valid.items() if n not in required]
+    if invalid:
+        params.append("**kwargs: Any")
     ret = annotation(spec.output_schema) if spec.output_schema else "Any"
     sig = f"async def {py_name(spec.name)}({', '.join(params)}) -> {ret}:"
-    return f"{sig}\n    {_docstring(spec.description)}\n    ..."
+    desc = _escape(spec.description)
+    if not invalid:
+        return f'{sig}\n    """{desc}"""\n    ...'
+    lines = [f'    """{desc}', ""]
+    for n, s in invalid.items():
+        req = ", required" if n in required else ""
+        lines.append(f'    - "{_escape(n)}": {annotation(s)}{req}')
+    lines.append('    """')
+    return sig + "\n" + "\n".join(lines) + "\n    ..."
 
 
 def index_by_py_name(specs: list[ToolSpec]) -> dict[str, ToolSpec]:
