@@ -8,8 +8,9 @@ import pytest
 
 pytest.importorskip("tiktoken")
 
+from astromesh_codemode._synthetic import synthetic_catalog
 from astromesh_codemode.eval import __main__ as cli
-from astromesh_codemode.eval.cost import Level1Row, format_markdown, run_level1
+from astromesh_codemode.eval.cost import Level1Row, format_markdown, run_level1, tool_set
 from astromesh_codemode.eval.scenarios import SCENARIOS, Scenario, expected_answer
 
 
@@ -21,6 +22,17 @@ def test_scenarios_are_the_product():
     assert {(s.catalog_size, s.data) for s in SCENARIOS} == {
         (n, d) for n in (8, 64, 512) for d in ("small", "large")
     }
+
+
+def test_both_strategies_get_the_same_read_only_tools():
+    for s in SCENARIOS:
+        tools = tool_set(s)
+        assert tools, s
+        assert not any(t.writes for t in tools)
+        reads = [t.name for t in synthetic_catalog(s.catalog_size) if not t.writes]
+        assert [t.name for t in tools] == reads
+    # The write tools exist in the bigger catalogs; they are left out of both strategies.
+    assert any(t.writes for t in synthetic_catalog(64))
 
 
 async def test_level1_deterministic_and_directional():

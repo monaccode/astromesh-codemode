@@ -116,6 +116,9 @@ uv sync --extra eval      # or the dev group: tiktoken is all level 1 needs
 uv run python -m astromesh_codemode.eval cost --level 1   # writes results/<date>-L1.{json,md}
 ```
 
+The first run downloads the `o200k_base` tokenizer file (tiktoken caches it after that),
+so it needs network once.
+
 ```python
 from astromesh_codemode.eval.cost import run_level1
 from astromesh_codemode.eval.scenarios import SCENARIOS, Scenario
@@ -131,6 +134,12 @@ amount and customer name". The tools are `synthetic_catalog(n)`: the four core t
 first, then generated ones (about half of them `writes=True` from 64 tools on).
 Order `i` has amount `10 + i`, so the top 3 never tie.
 
+**Both strategies see the same tool set: the catalog's read-only tools** (`writes=False`),
+which is what `CodeMode` v0.1 binds. Write tools appear in neither. A 64-tool catalog
+gives 32 read-only tools to each strategy, a 512-tool catalog 256; the 8-tool catalog has
+no write tools. A real agent that also needs write tools would carry them as direct tools
+in both cases, so they would add the same schema cost to both sides.
+
 Six scenarios: catalog size `{8, 64, 512}` × data `{small: 5 rows, large: 500 rows}`.
 The system prompt and the user message are the same text for both strategies.
 
@@ -138,7 +147,7 @@ The system prompt and the user message are the same text for both strategies.
 
 | Call | `direct` (classic tool calling) | `codemode` |
 |---|---|---|
-| tools array | every tool of the catalog, on every call | `codemode_search` and `codemode_run` only |
+| tools array | every read-only tool of the catalog, on every call | `codemode_search` and `codemode_run` only |
 | 1 | calls `list_orders(limit=N)` | calls `codemode_search("list orders and get customer")` |
 | 2 | sees the real rows (JSON), calls `get_customer` three times in one turn (parallel tool calls) | sees the real `search` output, sends one fixed program to `codemode_run` (fetch, sort, top 3, `asyncio.gather` the customers, return a compact list) |
 | 3 | sees the three customers, answers | sees the real `run` output, answers |
@@ -176,13 +185,13 @@ Date: 2026-11-25. Tokenizer: `o200k_base`.
 | 8 | small | codemode | 3 | 1897 | 164 | 0.95 |
 | 8 | large | direct | 3 | 20799 | 74 |  |
 | 8 | large | codemode | 3 | 1897 | 164 | 0.09 |
-| 64 | small | direct | 3 | 13758 | 74 |  |
-| 64 | small | codemode | 3 | 2073 | 164 | 0.15 |
-| 64 | large | direct | 3 | 32568 | 74 |  |
-| 64 | large | codemode | 3 | 2073 | 164 | 0.06 |
-| 512 | small | direct | 3 | 107643 | 74 |  |
-| 512 | small | codemode | 3 | 1897 | 164 | 0.02 |
-| 512 | large | direct | 3 | 126453 | 74 |  |
+| 64 | small | direct | 3 | 7578 | 74 |  |
+| 64 | small | codemode | 3 | 2073 | 164 | 0.27 |
+| 64 | large | direct | 3 | 26388 | 74 |  |
+| 64 | large | codemode | 3 | 2073 | 164 | 0.08 |
+| 512 | small | direct | 3 | 58047 | 74 |  |
+| 512 | small | codemode | 3 | 1897 | 164 | 0.03 |
+| 512 | large | direct | 3 | 76857 | 74 |  |
 | 512 | large | codemode | 3 | 1897 | 164 | 0.02 |
 
 ratio < 1: Code Mode carries less context; > 1: it carries more.
@@ -198,11 +207,8 @@ Read it with its losses:
   small schemas); the test asserts that too.
 - **Large data or a large catalog: Code Mode carries far less.** 500 rows go back into
   `direct`'s context and are re-sent on the next calls; in Code Mode they stay in the
-  sandbox. A 512-tool catalog costs `direct` its schemas on every call.
-- The `direct` tools array holds the whole catalog, `writes=True` tools included, while
-  Code Mode v0.1 exposes only read tools. A read-only classic agent that dropped the
-  write tools would carry less: for 64 and 512 tools the ratio would be about 0.27 and
-  0.03 with small data, instead of 0.15 and 0.02.
+  sandbox. The 256 read-only tools of the 512 catalog cost `direct` their schemas on
+  every call.
 
 ### Limits of level 1
 

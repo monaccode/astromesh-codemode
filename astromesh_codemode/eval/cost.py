@@ -3,7 +3,10 @@
 No LLM is called. A scripted model plays the same task twice per scenario
 (``scenarios.py``), against the real tools:
 
-- ``direct``: classic tool calling. Every tool of the catalog is in the ``tools`` array
+Both strategies see the same tool set: the catalog's read-only tools (``writes=False``),
+which is what ``CodeMode`` v0.1 binds. Write tools appear in neither.
+
+- ``direct``: classic tool calling. Every read-only tool is in the ``tools`` array
   on every call. Call 1 asks for ``list_orders``; call 2 sees its real result and asks
   for ``get_customer`` three times in one turn (parallel tool calls); call 3 sees the
   three results and answers.
@@ -52,6 +55,7 @@ __all__ = [
     "ratios",
     "run_level1",
     "to_json",
+    "tool_set",
 ]
 
 ENCODING = "o200k_base"
@@ -227,11 +231,16 @@ async def _codemode(scenario: Scenario, catalog: list[ToolSpec]) -> Level1Row:
     )
 
 
+def tool_set(scenario: Scenario) -> list[ToolSpec]:
+    """The tools both strategies get: the catalog's read-only tools (what CodeMode v0.1 binds)."""
+    return [t for t in synthetic_catalog(scenario.catalog_size) if not t.writes]
+
+
 async def run_level1(scenarios: Iterable[Scenario]) -> list[Level1Row]:
-    """For each scenario, a ``direct`` row then a ``codemode`` row."""
+    """For each scenario, a ``direct`` row then a ``codemode`` row, over the same tools."""
     rows: list[Level1Row] = []
     for s in scenarios:
-        catalog = synthetic_catalog(s.catalog_size)
+        catalog = tool_set(s)
         rows.append(await _direct(s, catalog))
         rows.append(await _codemode(s, catalog))
     return rows

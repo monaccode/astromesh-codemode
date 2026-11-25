@@ -123,7 +123,7 @@
         "rows": 5
       },
       "strategy": "direct",
-      "context_tokens": 13758,
+      "context_tokens": 7578,
       "output_tokens": 74,
       "model_calls": 3,
       "answer": [
@@ -179,7 +179,7 @@
         "rows": 500
       },
       "strategy": "direct",
-      "context_tokens": 32568,
+      "context_tokens": 26388,
       "output_tokens": 74,
       "model_calls": 3,
       "answer": [
@@ -235,7 +235,7 @@
         "rows": 5
       },
       "strategy": "direct",
-      "context_tokens": 107643,
+      "context_tokens": 58047,
       "output_tokens": 74,
       "model_calls": 3,
       "answer": [
@@ -291,7 +291,7 @@
         "rows": 500
       },
       "strategy": "direct",
-      "context_tokens": 126453,
+      "context_tokens": 76857,
       "output_tokens": 74,
       "model_calls": 3,
       "answer": [
@@ -355,22 +355,22 @@
     {
       "catalog_size": 64,
       "data": "small",
-      "codemode/direct": 0.1507
+      "codemode/direct": 0.2736
     },
     {
       "catalog_size": 64,
       "data": "large",
-      "codemode/direct": 0.0637
+      "codemode/direct": 0.0786
     },
     {
       "catalog_size": 512,
       "data": "small",
-      "codemode/direct": 0.0176
+      "codemode/direct": 0.0327
     },
     {
       "catalog_size": 512,
       "data": "large",
-      "codemode/direct": 0.015
+      "codemode/direct": 0.0247
     }
   ]
 }
