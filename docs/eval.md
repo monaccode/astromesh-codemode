@@ -216,11 +216,30 @@ Read it with its losses:
   never calls a tool it did not need. Real models do: a wrong argument in `direct`, or a
   program that fails in `run`, adds calls, and each extra call re-sends the whole
   context. Level 1 is the floor for both strategies, not what an agent will spend.
+- **Code Mode's program knows keys the stubs never showed.** The fixed program indexes
+  `o["id"]`, `o["amount"]`, `o["customer_id"]` and `c["name"]`, but the `search` stubs
+  only say `list_orders(...) -> list[dict]` and `get_customer(...) -> dict`. `direct`
+  learns those keys from the rows it is sent; the scripted Code Mode gets them for free.
+  A real model has to guess them or spend an extra `run` to look at a row first, which
+  adds a call that re-sends the context. Level 2 measures that cost.
 - **One task shape.** Fetch, filter, fan out. Tasks where the model must read every
-  result anyway (summarise these 500 rows in prose) favour Code Mode less.
+  result anyway (summarise these 500 rows in prose) favour Code Mode less. And `direct`
+  carries the 500 rows only because `list_orders` takes nothing but `limit`: there is
+  no sort or top-k parameter, so the model must fetch everything to find the top 3.
+  With a tool like `list_orders(sort="amount", limit=3)`, `direct`'s large-data cost
+  would mostly vanish, and the `large` rows would look much like the `small` ones.
 - **One tokenizer, one template.** `o200k_base` and OpenAI's per-message estimate.
   Other providers tokenise and template tools differently, and some cache the tools
   array between calls, which shrinks `direct`'s schema cost.
+- **The tools array is counted as raw JSON, which likely overstates `direct`.** Level 1
+  counts `json.dumps` of the OpenAI-style array, keys, quotes and braces included.
+  Providers render tools into their own templates before the model sees them, usually
+  more compact than that JSON. Both strategies are counted the same way, but `direct`'s
+  array is larger (476 vs 349 tokens at 8 tools, 2339 at 64, 19162 at 512: 1.4×, 6.7×
+  and 55× Code Mode's two schemas), and it is re-sent on every call, so the overcount
+  weighs far more on `direct`. The ratios driven by catalog size (64 and 512 tools with
+  small data) therefore lean toward Code Mode: the true ratios there are likely higher
+  than 0.27 and 0.03.
 - **No prices.** Tokens only; input and output are reported separately, not weighted.
 
 Level 2 runs the same task with real models and counts what they actually spend,
