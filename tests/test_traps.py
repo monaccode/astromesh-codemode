@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from astromesh_codemode import CodeMode, Limits
+from astromesh_codemode import CodeMode, Limits, sandbox
 from astromesh_codemode.eval import TrapReport, format_report, run_traps, traps
 from astromesh_codemode.eval import __main__ as cli
 
@@ -64,3 +64,25 @@ def test_cli_exit_status(monkeypatch, capsys, stopped, code):
     assert f"{stopped}/2 traps stopped" in out
     assert "call_budget" in out
     assert "e2" in out
+
+
+async def test_output_flood_exercises_success_path_truncation():
+    outcome = await traps.output_flood(Limits())
+    assert outcome.stopped, outcome.detail
+    assert "max_output_bytes hit: 2" in outcome.detail
+    assert "missing notice: 0" in outcome.detail
+
+
+async def test_output_flood_not_stopped_when_truncation_drops_its_notice(monkeypatch):
+    def silent_cut(main, prints, cap):
+        full = (f"stdout:\n{prints}\n\n" if prints else "") + main
+        return full.encode()[:cap].decode(errors="ignore"), len(full.encode()) > cap
+
+    monkeypatch.setattr(sandbox, "compose", silent_cut)
+    outcome = await traps.output_flood(Limits())
+    assert not outcome.stopped, outcome.detail
+
+
+async def test_output_flood_not_stopped_with_lax_output_cap():
+    outcome = await traps.output_flood(Limits(max_output_bytes=10**9))
+    assert not outcome.stopped, outcome.detail

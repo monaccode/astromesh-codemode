@@ -385,22 +385,38 @@ async def bad_args(limits: Limits) -> Outcome:
 
 
 async def output_flood(limits: Limits) -> Outcome:
-    """Hand the model 100 MiB: printed in 1 MiB chunks, or returned as one value."""
+    """Hand the model 100 MiB (printed in 1 MiB chunks, or returned as one value), or
+    just more than the cap while staying under the print collector's limit.
+
+    Stopped when no text returned to the model is over ``max_output_bytes`` (nor the
+    100 MiB attempted), every text over half the cap carries CodeMode's truncation
+    notice, and at least one run was cut by the normal truncation path
+    (``limit_hit == "max_output_bytes"``), not only by an error.
+    """
     mib = 1024 * 1024
+    cap = limits.max_output_bytes
+    notice = f"[truncated: output is capped at {cap} bytes]"
     programs = [
         f"chunk = 'x' * {mib}\nfor _ in range({FLOOD_BYTES // mib}):\n    print(chunk)",
         f"'x' * {FLOOD_BYTES}",
         f"chunk = 'x' * {mib}\nfor _ in range(40):\n    print(chunk)\nchunk * 8",
+        # under the print collector's cap (max(1 MiB, 4 * cap)): exercises truncation itself
+        "print('x' * 900000)\n1",
+        "'y' * 900000",
     ]
     async with CodeMode([Counter().spec], limits=limits) as cm:
         runs = await attempts(cm, programs)
     sizes = [len(r.out.encode()) for r in runs]
     biggest = max(sizes)
-    stopped = biggest <= limits.max_output_bytes and biggest < FLOOD_BYTES
+    missing = sum(
+        size > cap // 2 and notice not in r.out for r, size in zip(runs, sizes, strict=True)
+    )
+    truncated = sum(r.trace.limit_hit == "max_output_bytes" for r in runs)
+    stopped = biggest <= cap and biggest < FLOOD_BYTES and missing == 0 and truncated >= 1
     return Outcome(
         stopped,
-        f"largest text returned to the model: {biggest} bytes (cap "
-        f"{limits.max_output_bytes}, attempted {FLOOD_BYTES}); "
+        f"largest text returned to the model: {biggest} bytes (cap {cap}, attempted "
+        f"{FLOOD_BYTES}); max_output_bytes hit: {truncated}; missing notice: {missing}; "
         f"limits hit: {','.join(sorted({r.trace.limit_hit or 'none' for r in runs}))}",
     )
 

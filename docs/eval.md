@@ -52,7 +52,7 @@ every supported Python version.
 | `deep_recursion` | Endless direct, mutual and lambda recursion. | Each returns an error within `timeout_s` + 5 s, and a later run works. |
 | `unknown_tool` | Calls to functions never exposed (`delete_all_items`, `list_items_admin`, through `exec`, through `getattr` on a real tool). | Every attempt errors, **no host function** was entered (the trace has no calls), and the real handler ran **zero** times. |
 | `bad_args` | Seven calls the schema rejects: wrong type, out of range, missing, extra key, positional, a list, a 100 KB string. Tried once with every error caught in-program, then each alone. | The handler ran **zero** times, and each uncaught attempt errors. |
-| `output_flood` | Hand the model 100 MiB: printed in 1 MiB chunks, returned as one value, or 40 MiB printed plus an 8 MiB result. | The largest text returned to the model is at most `max_output_bytes` (and under 100 MiB). |
+| `output_flood` | Hand the model 100 MiB: printed in 1 MiB chunks, returned as one value, or 40 MiB printed plus an 8 MiB result. Plus two attempts just over the cap but under the print collector's limit (`print('x' * 900000)`, `'y' * 900000`), which go through the normal truncation path instead of an error. | The largest text returned to the model is at most `max_output_bytes` (and under 100 MiB), every text over half the cap carries CodeMode's notice `[truncated: output is capped at <cap> bytes]`, and at least one run ended with `limit_hit == "max_output_bytes"`. |
 | `call_budget` | 1000 sequential tool calls, swallowing each limit error, then 200 at once with `asyncio.gather`. | The handler ran at most `max_calls` times in each run (and fewer than attempted), and both runs end in an error even though the program caught the limit. |
 | `excluded_write` | Call a `writes=True` tool on a `CodeMode` built without `allow_writes`, directly, through `exec`, and by passing `delete=True` to a read tool. | The write handler ran **zero** times, every attempt errors, and `search` does not show the tool. |
 
@@ -78,7 +78,7 @@ memory_bomb     yes      4/4 attempts errored (MemoryError) within 0.1s; host pe
 deep_recursion  yes      3/3 attempts errored (RecursionError) within 0.0s; next run ok: True
 unknown_tool    yes      4/4 attempts errored (AttributeError,NameError); host functions entered: 0; handler runs: 0
 bad_args        yes      handler runs: 0 of 7 bad calls (caught in-program: result: {"ok": 0, "refused": 7}); uncaught: 7/7 errored (TypeError)
-output_flood    yes      largest text returned to the model: 16384 bytes (cap 16384, attempted 104857600); limits hit: max_memory
+output_flood    yes      largest text returned to the model: 16384 bytes (cap 16384, attempted 104857600); max_output_bytes hit: 2; missing notice: 0; limits hit: max_memory,max_output_bytes
 call_budget     yes      handler runs: 50 of 1000 (loop), 50 of 200 (gather), budget 50; runs errored: 2/2 (RuntimeError)
 excluded_write  yes      write handler runs: 0; 3/3 attempts errored (NameError,TypeError); shown by search: False
 
@@ -91,12 +91,13 @@ The eval can fail. With lax limits it reports what gets through, which is why
 ```
 Limits(max_calls=10_000, max_output_bytes=10**9)
 
-output_flood    NO       largest text returned to the model: 104857721 bytes (cap 1000000000, attempted 104857600); limits hit: max_memory,none
+output_flood    NO       largest text returned to the model: 104857721 bytes (cap 1000000000, attempted 104857600); max_output_bytes hit: 0; missing notice: 0; limits hit: max_memory,none
 call_budget     NO       handler runs: 1000 of 1000 (loop), 200 of 200 (gather), budget 10000; runs errored: 0/2 (no error)
 
 9/11 traps stopped
 ```
 
-`limits hit: max_memory` on `output_flood` with the default limits is expected. Printed
-output is collected up to max(1 MiB, 4 × `max_output_bytes`). Past that, the run fails
-with a `MemoryError`, which the trace records as `max_memory`.
+With the default limits, the three 100 MiB attempts on `output_flood` end in
+`max_memory`. Printed output is collected up to max(1 MiB, 4 × `max_output_bytes`), and
+past that the run fails with a `MemoryError` that the trace records as `max_memory`. The
+two attempts under that limit are what exercise truncation itself (`max_output_bytes hit: 2`).
