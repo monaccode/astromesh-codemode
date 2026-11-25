@@ -244,3 +244,84 @@ Read it with its losses:
 
 Level 2 runs the same task with real models and counts what they actually spend,
 repair loops and extra calls included.
+
+## Cost — level 2: real models
+
+Level 1 is a floor: a scripted model that never errs and knows the result keys. Level 2
+runs the same six scenarios with real models through [litellm](https://docs.litellm.ai)
+and measures what an agent actually spends to get the answer right, repair loops and
+extra calls included. **It calls paid APIs**, so it never runs in CI; its tests
+(`tests/test_cost_l2.py`) mock `litellm.acompletion` and spend nothing.
+
+### How to reproduce
+
+```bash
+uv sync --extra eval
+export OPENAI_API_KEY=...        # the env var of each requested model's provider
+uv run --extra eval python -m astromesh_codemode.eval cost --level 2 \
+    --models gpt-4o-mini,gpt-4o [--repeats 3] [--scenarios 64/large,512/small]
+# writes results/<date>-L2.{json,md}
+```
+
+- `--models`: comma-separated litellm model names (`gpt-4o-mini`,
+  `anthropic/claude-...`, `gemini/...`). Each needs a price in `litellm.model_cost`.
+- `--repeats` (default 3): attempts per (model, scenario, strategy).
+- `--scenarios` (default all six): `<catalog>/<small|large>`.
+- **It refuses to start** (exit 2, nothing called) when a model's provider key is not set
+  (as reported by `litellm.validate_environment`) or the model has no known price.
+- Before starting it prints the upper bound: models × scenarios × 2 strategies × repeats ×
+  12 model calls (and × 3 counting retries). A full run with 2 models and 3 repeats is at
+  most 864 model calls; a model that answers in 3 calls makes about 216.
+
+```python
+from astromesh_codemode.eval.cost import run_level2
+from astromesh_codemode.eval.scenarios import SCENARIOS
+
+rows = await run_level2(SCENARIOS, ["gpt-4o-mini"], repeats=3)
+```
+
+### What one attempt is
+
+A real agent loop, the same for both strategies except for the `tools` array:
+
+- The model gets the **same system prompt and user task** as level 1, and nothing else:
+  no result keys, no example program, no hint beyond the tool descriptions (and, for
+  Code Mode, what `search` returns).
+- `direct`: the scenario's read-only catalog as OpenAI-style tools. `codemode`: only
+  `codemode_search` and `codemode_run` from `CodeMode.tool_definitions()`.
+- Every tool call the model makes runs for real (the catalog's handlers, or the real
+  `CodeMode` with its Monty sandbox) and its result goes back as a `tool` message. Parallel
+  tool calls in one turn all run and all go back, in order. A bad call (unknown tool,
+  arguments that are not JSON, a handler error) goes back as an `Error: ...` text, as a
+  framework would send it.
+- The loop ends when the model answers without tool calls, or after **12 model calls**:
+  an attempt still calling tools at the cap fails (`capped`).
+- A model request that fails (rate limit, provider error) is retried twice, after 2 s and
+  8 s. If the third try fails too, the attempt fails and its exception type is recorded
+  in `errors`; the run goes on with the next attempt.
+
+### What it measures
+
+Per (model, scenario, strategy), averaged over the attempts:
+
+- **`success_rate`**: fraction of attempts whose final answer contains the rows of
+  `expected_answer` (the same function as level 1) in order: the three customer names in
+  the expected order, each matched whole, and each row's order id and amount next to its
+  name. The wording is free.
+- **`model_calls`**: model requests that returned a response (failed requests do not count).
+- **`tokens_in`, `tokens_out`**: the `usage` the provider reported (`prompt_tokens`,
+  `completion_tokens`), summed over the attempt's calls. Not estimated: the provider's
+  own tokenizer and tool template.
+- **`cost_usd`**: `tokens_in × input price + tokens_out × output price`, prices per token
+  from `litellm.model_cost` for the installed litellm version. Prompt caching discounts
+  are not applied, so for providers that cache the tools array this overstates `direct`.
+- **`latency_s`**: wall clock per attempt, model calls, tool runs and retry waits included.
+  The Monty worker pool is started before the timed attempts.
+- **`capped`**, **`errors`**: as above. Failed attempts stay in every average: the tokens
+  they spent were spent.
+
+### Result
+
+_Not run yet._ The table goes here, as it comes out of
+`results/<date>-L2.md`, with the models used and the conclusion it supports (or that it
+supports none). Until then, no claim of "Code Mode pays off from N tools" holds.

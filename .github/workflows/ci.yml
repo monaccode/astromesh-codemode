@@ -23,13 +23,14 @@ jobs:
       - run: uv sync --locked --python ${{ matrix.python }}
       - run: uv run --python ${{ matrix.python }} pytest -q
   adapters:
-    # Framework adapters: every extra installed (the core matrix skips these tests).
+    # Framework adapters and the level-2 cost eval (mocked litellm): every extra installed
+    # (the core matrix skips these tests).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --locked --all-extras --python 3.12
-      - run: uv run --locked --all-extras --python 3.12 pytest -q tests/adapters
+      - run: uv run --locked --all-extras --python 3.12 pytest -q tests/adapters tests/test_cost_l2.py
   traps:
     # The sandbox's security proof: malicious programs with the default Limits().
     # Exits 1 (red build) if a single trap gets through. See docs/eval.md.

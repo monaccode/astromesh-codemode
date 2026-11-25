@@ -18,3 +18,10 @@
   (catálogo 8/64/512 × 5/500 filas), escribe `results/<fecha>-L1.{json,md}` y corre en CI.
   Extra `eval` (`tiktoken`, `litellm`). Code Mode pierde en salida en todos los escenarios
   y en contexto con 4 tools y 5 filas; ver `docs/eval.md`.
+- Eval de costo nivel 2 (`python -m astromesh_codemode.eval cost --level 2 --models a,b`,
+  `run_level2`): los mismos escenarios con modelos reales vía `litellm`, loop de agente real
+  por estrategia (tope 12 llamadas al modelo por intento, 2 reintentos con backoff ante
+  errores del proveedor), éxito contra `expected_answer`, tokens de `usage`, costo con
+  `litellm.model_cost`, latencia por intento; escribe `results/<fecha>-L2.{json,md}`. Se
+  niega a correr (exit 2) sin la API key del proveedor o sin precio conocido. Tests con
+  `litellm.acompletion` mockeado; la tabla real todavía no está.

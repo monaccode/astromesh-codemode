@@ -28,13 +28,25 @@ Counting, with ``tiktoken`` ``o200k_base``:
   for ``run``), or the final answer.
 
 See ``docs/eval.md`` ("Cost — level 1") for the limits of this measure.
+
+Level 2 (``run_level2``) runs the same scenarios with real models through
+``litellm.acompletion``. Each attempt is a real agent loop: system prompt + task + tools
+(``direct``: the shared read-only catalog; ``codemode``: only ``CodeMode``'s two tools);
+every tool call the model makes runs against the real handlers or the real ``CodeMode``
+and its result goes back, until the model answers without tool calls or after
+``MAX_MODEL_CALLS``. Tokens come from each response's ``usage``; cost is ``usage`` x the
+per-token prices in ``litellm.model_cost``. See ``docs/eval.md`` ("Cost — level 2").
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Iterable
-from dataclasses import asdict, dataclass
+import re
+import time
+from collections import Counter
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import asdict, dataclass, field
 from functools import cache
 from typing import Any, Literal
 
@@ -44,17 +56,27 @@ from astromesh_codemode.eval.scenarios import (
     SYSTEM_PROMPT,
     TOP_K,
     Scenario,
+    expected_answer,
     user_task,
 )
 from astromesh_codemode.spec import ToolSpec
 
 __all__ = [
     "ENCODING",
+    "MAX_MODEL_CALLS",
     "Level1Row",
+    "Level2Row",
+    "answer_matches",
     "format_markdown",
+    "format_markdown_l2",
+    "max_model_requests",
+    "missing_api_keys",
+    "price_per_token",
     "ratios",
     "run_level1",
+    "run_level2",
     "to_json",
+    "to_json_l2",
     "tool_set",
 ]
 
@@ -291,4 +313,302 @@ def format_markdown(rows: list[Level1Row], date: str | None = None) -> str:
             f"| {r.context_tokens} | {r.output_tokens} | {ratio} |"
         )
     lines += ["", "ratio < 1: Code Mode carries less context; > 1: it carries more.", ""]
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- level 2
+
+MAX_MODEL_CALLS = 12
+"""Model calls per attempt; an attempt still calling tools at the cap fails."""
+RETRY_BACKOFF_S = (2.0, 8.0)
+"""Seconds to wait before each retry of a failed model request: 2 retries."""
+_sleep = asyncio.sleep  # patched in tests
+
+ToolHandler = Callable[..., Awaitable[Any]]
+
+
+@dataclass(frozen=True)
+class Level2Row:
+    """One (model, scenario, strategy), averaged over ``attempts`` repeats."""
+
+    model: str
+    scenario: Scenario
+    strategy: Strategy
+    success_rate: float
+    """Fraction of attempts whose final answer matched ``expected_answer``."""
+    model_calls: float
+    """Model calls that returned a response (requests that failed are not counted)."""
+    tokens_in: float
+    tokens_out: float
+    cost_usd: float
+    latency_s: float
+    """Wall clock per attempt: model calls, tool runs and retry backoff included."""
+    attempts: int
+    capped: float = 0.0
+    """Fraction of attempts that reached ``MAX_MODEL_CALLS`` still calling tools."""
+    errors: dict[str, int] = field(default_factory=dict)
+    """Attempts lost to a model error after the retries, by exception type."""
+
+
+@dataclass
+class _Attempt:
+    success: bool = False
+    calls: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    latency_s: float = 0.0
+    capped: bool = False
+    error: str | None = None
+
+
+def _litellm() -> Any:
+    try:
+        import litellm
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        raise ImportError(
+            "The level-2 cost eval needs litellm: pip install 'astromesh-codemode[eval]'"
+        ) from exc
+    return litellm
+
+
+def price_per_token(model: str) -> tuple[float, float] | None:
+    """``(input, output)`` USD per token from ``litellm.model_cost``, or None if unknown."""
+    table = _litellm().model_cost
+    for key in (model, model.split("/", 1)[-1]):
+        entry = table.get(key) or {}
+        if "input_cost_per_token" in entry and "output_cost_per_token" in entry:
+            return float(entry["input_cost_per_token"]), float(entry["output_cost_per_token"])
+    return None
+
+
+def missing_api_keys(model: str) -> list[str]:
+    """Env vars litellm says ``model``'s provider needs and are not set; [] when ready."""
+    env = _litellm().validate_environment(model)
+    return [] if env.get("keys_in_environment") else list(env.get("missing_keys") or [])
+
+
+def _number(n: float) -> re.Pattern[str]:
+    return re.compile(rf"(?<![\d.]){re.escape(str(n))}(?:\.0+)?(?!\d)")
+
+
+def answer_matches(text: str | None, expected: list[dict]) -> bool:
+    """True when ``text`` gives every row of ``expected_answer``, in order, in any wording.
+
+    The customer names must appear in the expected order, each matched whole
+    (``Customer 1`` is not found inside ``Customer 12``). Each row's order id and amount
+    must appear between the previous row's name and the next row's name, so they can be
+    written before or after the name ("order 499, 509 USD, Customer 3" or
+    "Customer 3: #499, $509.00").
+    """
+    if not text or not expected:
+        return False
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    for row in expected:
+        name = re.compile(rf"(?<!\w){re.escape(str(row['customer']))}(?!\w)")
+        m = name.search(text, pos)
+        if m is None:
+            return False
+        spans.append(m.span())
+        pos = m.end()
+    for i, row in enumerate(expected):
+        lo = spans[i - 1][1] if i else 0
+        hi = spans[i + 1][0] if i + 1 < len(spans) else len(text)
+        window = text[lo:hi]
+        if not (_number(row["amount"]).search(window) and _number(row["order_id"]).search(window)):
+            return False
+    return True
+
+
+def _call_dict(call: Any) -> dict:
+    return {
+        "id": call.id,
+        "type": "function",
+        "function": {"name": call.function.name, "arguments": call.function.arguments or ""},
+    }
+
+
+async def _complete(model: str, messages: list[dict], tools: list[dict]) -> Any:
+    """``litellm.acompletion``, retried ``len(RETRY_BACKOFF_S)`` times; raises the last error."""
+    litellm = _litellm()
+    for wait in (*RETRY_BACKOFF_S, None):
+        try:
+            return await litellm.acompletion(model=model, messages=messages, tools=tools)
+        except Exception:
+            if wait is None:
+                raise
+            await _sleep(wait)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+async def _run_tool(handlers: dict[str, ToolHandler], call: dict) -> str:
+    """Run one tool call; a failure goes back to the model as text, as frameworks do."""
+    name = call["function"]["name"]
+    if name not in handlers:
+        return f"Error: unknown tool {name!r}. Available tools: {', '.join(handlers)}."
+    try:
+        args = json.loads(call["function"]["arguments"] or "{}")
+        if not isinstance(args, dict):
+            raise TypeError("tool arguments must be a JSON object")
+        result = await handlers[name](**args)
+    except Exception as exc:  # noqa: BLE001 - the model sees the error, the eval goes on
+        return f"Error: {type(exc).__name__}: {exc}"
+    return result if isinstance(result, str) else json.dumps(result, default=str)
+
+
+async def _attempt(
+    model: str,
+    scenario: Scenario,
+    tools: list[dict],
+    handlers: dict[str, ToolHandler],
+    expected: list[dict],
+) -> _Attempt:
+    out = _Attempt()
+    messages: list[dict] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_task(scenario)},
+    ]
+    start = time.perf_counter()
+    try:
+        while True:
+            if out.calls >= MAX_MODEL_CALLS:
+                out.capped = True
+                break
+            try:
+                resp = await _complete(model, messages, tools)
+            except Exception as exc:  # noqa: BLE001 - recorded with its type, the run goes on
+                out.error = type(exc).__name__
+                break
+            out.calls += 1
+            usage = getattr(resp, "usage", None)
+            out.tokens_in += int(getattr(usage, "prompt_tokens", 0) or 0)
+            out.tokens_out += int(getattr(usage, "completion_tokens", 0) or 0)
+            msg = resp.choices[0].message
+            calls = [_call_dict(c) for c in getattr(msg, "tool_calls", None) or []]
+            if not calls:
+                out.success = answer_matches(msg.content, expected)
+                break
+            messages.append({"role": "assistant", "content": msg.content, "tool_calls": calls})
+            # Parallel tool calls: every one runs and every result goes back, in order.
+            for call in calls:
+                content = await _run_tool(handlers, call)
+                messages.append({"role": "tool", "tool_call_id": call["id"], "content": content})
+    finally:
+        out.latency_s = time.perf_counter() - start
+    return out
+
+
+def _row(
+    model: str,
+    scenario: Scenario,
+    strategy: Strategy,
+    attempts: list[_Attempt],
+    prices: tuple[float, float],
+) -> Level2Row:
+    n = len(attempts)
+    p_in, p_out = prices
+
+    def mean(xs: Iterable[float]) -> float:
+        return sum(xs) / n
+
+    return Level2Row(
+        model=model,
+        scenario=scenario,
+        strategy=strategy,
+        success_rate=mean(a.success for a in attempts),
+        model_calls=mean(a.calls for a in attempts),
+        tokens_in=mean(a.tokens_in for a in attempts),
+        tokens_out=mean(a.tokens_out for a in attempts),
+        cost_usd=mean(a.tokens_in * p_in + a.tokens_out * p_out for a in attempts),
+        latency_s=mean(a.latency_s for a in attempts),
+        attempts=n,
+        capped=mean(a.capped for a in attempts),
+        errors=dict(Counter(a.error for a in attempts if a.error)),
+    )
+
+
+async def run_level2(
+    scenarios: Iterable[Scenario], models: list[str], repeats: int = 3
+) -> list[Level2Row]:
+    """For each scenario and model, a ``direct`` row then a ``codemode`` row.
+
+    Raises ``ValueError`` before any model call when a model has no price in
+    ``litellm.model_cost``: the table would have no cost.
+    """
+    if repeats < 1:
+        raise ValueError(f"repeats must be >= 1, got {repeats}")
+    prices: dict[str, tuple[float, float]] = {}
+    for m in models:
+        p = price_per_token(m)
+        if p is None:
+            raise ValueError(f"no price for model {m!r} in litellm.model_cost")
+        prices[m] = p
+
+    rows: list[Level2Row] = []
+    for s in scenarios:
+        catalog = tool_set(s)
+        expected = await expected_answer(s)
+        direct_tools = _openai_tools((t.name, t.description, t.input_schema) for t in catalog)
+        direct_handlers: dict[str, ToolHandler] = {t.name: t.handler for t in catalog}
+        async with CodeMode(catalog) as cm:
+            defs = cm.tool_definitions()
+            cm_tools = _openai_tools((d.name, d.description, d.parameters) for d in defs)
+            cm_handlers: dict[str, ToolHandler] = {d.name: d.handler for d in defs}
+            await cm.run("None")  # start the worker pool outside the timed attempts
+            for m in models:
+                strategies: list[tuple[Strategy, list[dict], dict[str, ToolHandler]]] = [
+                    ("direct", direct_tools, direct_handlers),
+                    ("codemode", cm_tools, cm_handlers),
+                ]
+                for strategy, tools, handlers in strategies:
+                    attempts = [
+                        await _attempt(m, s, tools, handlers, expected) for _ in range(repeats)
+                    ]
+                    rows.append(_row(m, s, strategy, attempts, prices[m]))
+    return rows
+
+
+def max_model_requests(n_models: int, n_scenarios: int, repeats: int) -> tuple[int, int]:
+    """Upper bound of a level-2 run: ``(model calls, requests counting retries)``."""
+    calls = n_models * n_scenarios * 2 * repeats * MAX_MODEL_CALLS
+    return calls, calls * (len(RETRY_BACKOFF_S) + 1)
+
+
+def to_json_l2(rows: list[Level2Row], date: str, repeats: int) -> dict:
+    return {
+        "level": 2,
+        "date": date,
+        "repeats": repeats,
+        "max_model_calls": MAX_MODEL_CALLS,
+        "cost": "response usage x input/output cost per token from litellm.model_cost",
+        "rows": [
+            {**asdict(r), "scenario": asdict(r.scenario) | {"rows": r.scenario.rows}} for r in rows
+        ],
+    }
+
+
+def format_markdown_l2(rows: list[Level2Row], date: str | None = None) -> str:
+    """The table: model, scenario, strategy, success, calls, tokens, cost, latency, errors."""
+    lines = ["# Cost eval — level 2 (real models)", ""]
+    if date:
+        repeats = rows[0].attempts if rows else 0
+        lines += [
+            f"Date: {date}. {repeats} attempts per row, at most {MAX_MODEL_CALLS} model calls "
+            "each; every number but success is an average per attempt. See `docs/eval.md`.",
+            "",
+        ]
+    lines += [
+        "| model | catalog | data | strategy | success | model_calls | tokens_in | tokens_out "
+        "| cost_usd | latency_s | capped | errors |",
+        "|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    for r in rows:
+        errors = ", ".join(f"{k} x{v}" for k, v in sorted(r.errors.items()))
+        lines.append(
+            f"| {r.model} | {r.scenario.catalog_size} | {r.scenario.data} | {r.strategy} "
+            f"| {r.success_rate:.0%} | {r.model_calls:.1f} | {r.tokens_in:.0f} "
+            f"| {r.tokens_out:.0f} | {r.cost_usd:.6f} | {r.latency_s:.2f} "
+            f"| {r.capped:.0%} | {errors} |"
+        )
+    lines.append("")
     return "\n".join(lines)
