@@ -1,0 +1,12 @@
+# Proxy config: astromesh-codemode mcp --config examples/upstream.yaml
+name: codemode            # server name; tools become codemode_search / codemode_run
+limits:                   # optional; defaults shown
+  timeout_s: 30
+  max_calls: 50
+upstreams:
+  - name: fs              # tools are exposed as fs_<tool>
+    command: npx          # stdio upstream (use `url:` instead for streamable HTTP)
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    # Every upstream tool is treated as a write (hidden) unless it has
+    # readOnlyHint: true or is listed here (unprefixed server tool names).
+    read_only: [read_file, list_directory, search_files]
