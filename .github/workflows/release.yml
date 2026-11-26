@@ -1,0 +1,140 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+  # Re-run a release from main, e.g. to put an already-published version on TestPyPI.
+  # Without a tag only build, TestPyPI and the smoke run: PyPI and the GitHub Release
+  # are gated on refs/tags/v*.
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: test "${GITHUB_REF_NAME#v}" = "$(uv version --short)"
+      - run: uv sync --locked
+      - name: __version__ matches the package version
+        run: |
+          EXPECTED="$(uv version --short)"
+          uv run python -c "import sys, astromesh_codemode as a; sys.exit(a.__version__ != sys.argv[1] and f'__version__ {a.__version__} != {sys.argv[1]}')" "$EXPECTED"
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest -q
+      - name: Trap eval (every trap must be stopped)
+        run: uv run python -m astromesh_codemode.eval traps
+      - name: Cost eval, level 1 (scripted model; its checks must hold)
+        run: uv run python -m astromesh_codemode.eval cost --level 1 --out "${RUNNER_TEMP}/results"
+      - name: Adapter, level-2 (mocked) and docs tests (every extra installed)
+        run: |
+          uv sync --locked --all-extras --python 3.12
+          uv run --locked --all-extras --python 3.12 pytest -q tests/adapters tests/test_cost_l2.py tests/test_docs_examples.py
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  testpypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write # TestPyPI trusted publishing
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+  smoke:
+    needs: testpypi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4 # for pyproject.toml (the version) and the example
+      - uses: astral-sh/setup-uv@v6
+      - name: Install from TestPyPI (base dependencies only) and import it
+        run: |
+          VERSION="$(uv version --short)"
+          uv venv -q /tmp/smoke
+          export VIRTUAL_ENV=/tmp/smoke
+          # The package only from TestPyPI (--no-deps), its dependencies from PyPI.
+          # TestPyPI indexes with a delay, so retry; `ok` makes a run that never
+          # succeeds fail here instead of passing on the last `sleep`.
+          for _ in 1 2 3 4 5 6; do
+            uv pip install -q --no-deps --index-url https://test.pypi.org/simple/ \
+              "astromesh-codemode==${VERSION}" && ok=1 && break
+            echo "astromesh-codemode==${VERSION} not on TestPyPI yet; retrying in 30s"
+            sleep 30
+          done
+          test "${ok:-}" = 1 || { echo "::error::astromesh-codemode==${VERSION} never became installable from TestPyPI"; exit 1; }
+          # Dependencies read from the published wheel's own metadata (no hardcoded specs).
+          /tmp/smoke/bin/python "$GITHUB_WORKSPACE/.github/scripts/requires.py" > /tmp/base.txt
+          cat /tmp/base.txt
+          uv pip install -q -r /tmp/base.txt
+          cd /tmp
+          /tmp/smoke/bin/python -c "import astromesh_codemode; print(astromesh_codemode.__version__)"
+          test "$(/tmp/smoke/bin/python -c 'import astromesh_codemode; print(astromesh_codemode.__version__)')" = "$VERSION"
+          /tmp/smoke/bin/python -c "from astromesh_codemode import *; print('star import ok')"
+      - name: Search and run in the sandbox with the published package (examples/functions_quickstart.py)
+        run: |
+          # Run from /tmp so the installed package is imported, not the checkout.
+          cd /tmp && /tmp/smoke/bin/python "$GITHUB_WORKSPACE/examples/functions_quickstart.py"
+      - name: The published trap eval stops every trap
+        run: cd /tmp && /tmp/smoke/bin/python -m astromesh_codemode.eval traps
+
+  pypi:
+    needs: smoke
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # PyPI trusted publishing
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+  github-release:
+    needs: pypi
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Release notes from CHANGELOG.md
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # The body of "## [X.Y.Z] - date", up to the next "## [" heading.
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on && /^\[[^]]+\]: / { next }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "::error::no CHANGELOG.md section for ${VERSION}"; exit 1; }
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag --title "astromesh-codemode ${GITHUB_REF_NAME}" --notes-file notes.md
