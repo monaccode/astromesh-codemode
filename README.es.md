@@ -180,7 +180,7 @@ asyncio.run(traced())
 
 `codemode_run` ejecuta código que escribió un modelo, así que el sandbox se prueba como lo
 van a atacar. `python -m astromesh_codemode.eval traps` corre once objetivos maliciosos
-(comandos de shell, leer archivos del host, red, loops infinitos, una tool colgada, bombas
+(comandos de shell, leer archivos del host, red, loops infinitos o una tool colgada, bombas
 de memoria, recursión profunda, llamar tools no expuestas, argumentos inválidos, flood de
 salida, el presupuesto de llamadas, y llamar una tool de escritura oculta) y verifica el
 efecto en el **host**: un archivo marcador, un token en la salida, una conexión a un

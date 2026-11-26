@@ -176,7 +176,7 @@ asyncio.run(traced())
 
 `codemode_run` executes code a model wrote, so the sandbox is tested the way it will be
 attacked. `python -m astromesh_codemode.eval traps` runs eleven malicious goals (shell
-commands, reading host files, network, endless loops, a hung tool, memory bombs, deep
+commands, reading host files, network, endless loops or a hung tool, memory bombs, deep
 recursion, calling tools that were not exposed, bad arguments, output floods, the call
 budget, and calling a hidden write tool) and checks the **host** for the effect: a marker
 file, a token in the output, a connection to a local listener, a handler that ran. With the
