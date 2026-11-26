@@ -352,8 +352,16 @@ and one broken mid-loop stopped at an arbitrary point.
 - **`capped`**: fraction of the non-errored attempts that hit the 12-call cap.
 - **`errored`**, **`errors`**: how many attempts errored, and by which exception type.
 
-### Result
+### Result: pending
 
-_Not run yet._ The table goes here, as it comes out of
-`results/<date>-L2.md`, with the models used and the conclusion it supports (or that it
-supports none). Until then, no claim of "Code Mode pays off from N tools" holds.
+**Not run yet**: it needs provider API keys and spends money, and it has not been run. The
+command that will produce the table:
+
+```bash
+uv run --extra eval python -m astromesh_codemode.eval cost --level 2 --models gpt-4o-mini,gpt-4o
+```
+
+The table goes here, as it comes out of `results/<date>-L2.md`, with the models used and
+the conclusion it supports (or that it supports none), and in both READMEs. Until then, no
+claim of "Code Mode pays off from N tools" holds, and **astromesh-codemode 0.1.0 is not
+published to PyPI until that table is published.**
